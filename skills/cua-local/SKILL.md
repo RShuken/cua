@@ -142,3 +142,4 @@ This emits:
 - Set `CUA_LOCAL_QUIET=1` when you need less verbose output from looped macros.
 - Set `CUA_LOCAL_DELAY=0.25` or similar if a target UI needs slower pacing.
 - Run `scripts/smoke-test.sh` after substantial wrapper changes so SKILL examples stay honest.
+- Use `scripts/sync-to-fork.sh` to copy the current workspace skill into the fork clone, commit only if changed, and push to `origin/main`.
