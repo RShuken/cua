@@ -14,6 +14,8 @@ mouse, click, type, drag, and manage windows — like a human at the keyboard.
 
 Use this skill for **visual interaction** that can't be done via shell or API.
 
+> For local macOS host-control workflows with stronger wrapper ergonomics, verification helpers, browser macros, and a smoke suite, see the companion skill at `skills/cua-local/`.
+
 ## Setup
 
 ```bash
