@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# cua-driver installer — download the latest signed + notarized tarball
-# from GitHub Releases, move CuaDriver.app to /Applications, and symlink
-# the `cua-driver` binary into ~/.local/bin so shell users can invoke
-# it without typing the bundle path. Sudo-free.
+# cua-driver installer — download the latest Rust implementation from
+# GitHub Releases and wire it into the user's PATH. On macOS this moves
+# CuaDriver.app to /Applications and symlinks the `cua-driver` binary
+# into ~/.local/bin. Sudo-free.
 #
 # Usage (from README + release body):
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
@@ -12,11 +12,20 @@
 #                        ~/.local/bin (e.g. /usr/local/bin — that target needs sudo)
 #   --no-modify-path     skip auto-appending an `export PATH=...` line to your
 #                        shell rc when ~/.local/bin is missing from PATH
+#   --backend=rust       install the Rust implementation instead of the
+#                        default Swift macOS implementation. The Rust path
+#                        is also used automatically on non-macOS hosts,
+#                        where the Swift build can't run.
+#   --experimental-rust  legacy alias for --backend=rust.
+#   --backend=swift      explicit default — install the Swift macOS
+#                        implementation. macOS-only.
 #
 # Env overrides:
-#   CUA_DRIVER_VERSION=0.1.0   pin a specific release tag
-#   CUA_DRIVER_BIN_DIR=PATH    same as --bin-dir
-#   CUA_DRIVER_NO_MODIFY_PATH=1  same as --no-modify-path
+#   CUA_DRIVER_RS_VERSION=0.3.1      pin a specific Rust release tag
+#   CUA_DRIVER_VERSION=0.3.1         legacy alias for CUA_DRIVER_RS_VERSION
+#   CUA_DRIVER_RS_INSTALL_DIR=PATH  same as --bin-dir
+#   CUA_DRIVER_BIN_DIR=PATH         legacy alias for --bin-dir
+#   CUA_DRIVER_NO_MODIFY_PATH=1     same as --no-modify-path
 #
 # Uninstall:
 #   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/uninstall.sh)"
@@ -30,15 +39,121 @@ APP_DEST="/Applications/$APP_NAME"
 BIN_DIR="${CUA_DRIVER_BIN_DIR:-$HOME/.local/bin}"
 NO_MODIFY_PATH="${CUA_DRIVER_NO_MODIFY_PATH:-0}"
 
+# Rust implementation delegation target. The Rust install logic is a private
+# helper script colocated with this one — _install-rust.sh — so that
+# this directory holds the single user-facing install.sh per platform.
+# The Rust path below either execs the on-disk helper (dev /
+# checked-out-tree case) or curls this URL and pipes it to bash
+# (`curl ... | bash` install case).
+RUST_INSTALLER_URL="https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/_install-rust.sh"
+
 # Lightweight flag parsing (avoid getopt; macOS getopt is GNU-incompatible).
+#
+# Two-pass shape:
+#   1. Walk all argv and collect every unrecognised arg into FORWARDED_ARGS.
+#      That bucket is what we'd hand off to the Rust installer. Recognised
+#      shared flags (--bin-dir, --no-modify-path) are consumed in this pass
+#      and applied to local state.
+#   2. Only when --backend=rust (or --experimental-rust) was seen — or the
+#      host isn't macOS — exec into the Rust installer with FORWARDED_ARGS.
+#      Otherwise fall through to the default Swift install path below.
+#
+# This lets backend flags appear at any position, lets `--` end flag
+# parsing without breaking forwarding, and keeps both installers' argv shapes
+# (--bin-dir, --no-modify-path) bit-compatible.
+#
+# Default backend is the cross-platform Rust implementation. The Swift macOS
+# implementation is opt-in via --backend=swift, and only runs on macOS.
+USE_RUST_BACKEND=1
+FORWARDED_ARGS=()
+PASSTHROUGH=0
 while [[ $# -gt 0 ]]; do
+    if [[ "$PASSTHROUGH" == "1" ]]; then
+        FORWARDED_ARGS+=("$1"); shift; continue
+    fi
     case "$1" in
-        --bin-dir) BIN_DIR="$2"; shift 2 ;;
-        --bin-dir=*) BIN_DIR="${1#*=}"; shift ;;
-        --no-modify-path) NO_MODIFY_PATH=1; shift ;;
-        *) shift ;;
+        --experimental-rust) USE_RUST_BACKEND=1; shift ;;  # legacy alias for --backend=rust
+        --backend=rust)      USE_RUST_BACKEND=1; shift ;;  # opt into the Rust implementation
+        --backend=swift)     USE_RUST_BACKEND=0; shift ;;  # opt into the macOS-only Swift implementation
+        --backend=*)
+            printf 'error: unknown backend %q; supported: swift, rust\n' "${1#*=}" >&2
+            exit 2
+            ;;
+        --bin-dir)
+            if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                printf 'error: --bin-dir requires a value\n' >&2
+                exit 2
+            fi
+            BIN_DIR="$2"; FORWARDED_ARGS+=("$1" "$2"); shift 2 ;;
+        --bin-dir=*)         BIN_DIR="${1#*=}"; FORWARDED_ARGS+=("$1"); shift ;;
+        --no-modify-path)    NO_MODIFY_PATH=1; FORWARDED_ARGS+=("$1"); shift ;;
+        --)                  PASSTHROUGH=1; shift ;;  # forward the rest verbatim
+        *)                   FORWARDED_ARGS+=("$1"); shift ;;
     esac
 done
+
+# --- Opt-in delegation to the Rust implementation -----------------------
+#
+# The Swift backend only runs on macOS — so if it was explicitly requested
+# via --backend=swift on any non-macOS host, transparently fall back to the
+# Rust implementation, which is the only one that builds there.
+OS="$(uname -s 2>/dev/null || echo unknown)"
+if [[ "$USE_RUST_BACKEND" == "0" && "$OS" != "Darwin" ]]; then
+    printf 'note: Swift backend is macOS-only; falling back to the Rust implementation on %s.\n' "$OS" >&2
+    USE_RUST_BACKEND=1
+fi
+
+# Hand the rest of argv to _install-rust.sh and exit. The Swift install path
+# below is only reached when --backend=swift was selected on macOS.
+if [[ "$USE_RUST_BACKEND" == "1" ]]; then
+    if [[ "$OS" != "Darwin" ]]; then
+        printf 'note: detected non-macOS host (%s); installing cua-driver via the Rust implementation.\n' "$OS" >&2
+    else
+        printf 'note: installing cua-driver via the Rust implementation.\n' >&2
+    fi
+
+    if [[ -n "${CUA_DRIVER_BIN_DIR:-}" && -z "${CUA_DRIVER_RS_INSTALL_DIR:-}" ]]; then
+        export CUA_DRIVER_RS_INSTALL_DIR="$BIN_DIR"
+    fi
+    if [[ -n "${CUA_DRIVER_VERSION:-}" && -z "${CUA_DRIVER_RS_VERSION:-}" ]]; then
+        export CUA_DRIVER_RS_VERSION="$CUA_DRIVER_VERSION"
+    fi
+    if [[ -n "${CUA_DRIVER_NO_MODIFY_PATH:-}" && -z "${CUA_DRIVER_RS_NO_MODIFY_PATH:-}" ]]; then
+        export CUA_DRIVER_RS_NO_MODIFY_PATH="$CUA_DRIVER_NO_MODIFY_PATH"
+    fi
+
+    # Prefer the on-disk copy when this script is running from a checked-out
+    # tree (dev / CI). Falls back to curling the canonical URL for the
+    # `curl ... | bash` install path, where $BASH_SOURCE is unset / -.
+    LOCAL_RUST_INSTALLER=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "-" && -f "${BASH_SOURCE[0]}" ]]; then
+        SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+        # Helper lives next to this script under libs/cua-driver/scripts/.
+        CANDIDATE="$SCRIPT_DIR/_install-rust.sh"
+        if [[ -f "$CANDIDATE" ]]; then
+            LOCAL_RUST_INSTALLER="$CANDIDATE"
+        fi
+    fi
+
+    # macOS ships bash 3.2, which trips `set -u` when expanding an empty
+    # array via "${arr[@]}" — guard with the +alt-value pattern so the
+    # zero-arg case becomes a literal no-expansion.
+    if [[ -n "$LOCAL_RUST_INSTALLER" ]]; then
+        exec /bin/bash "$LOCAL_RUST_INSTALLER" ${FORWARDED_ARGS[@]+"${FORWARDED_ARGS[@]}"}
+    else
+        if ! command -v curl >/dev/null 2>&1; then
+            printf 'error: curl not found on PATH; cannot fetch %s\n' "$RUST_INSTALLER_URL" >&2
+            exit 1
+        fi
+        # `exec` so the Rust installer replaces this process — we don't want
+        # to fall through to the Swift install path on any error here.
+        RUST_INSTALLER_SCRIPT="$(curl -fsSL "$RUST_INSTALLER_URL")" || {
+            printf 'error: failed to download Rust installer from %s\n' "$RUST_INSTALLER_URL" >&2
+            exit 1
+        }
+        exec /bin/bash -c "$RUST_INSTALLER_SCRIPT" cua-driver-rs-install ${FORWARDED_ARGS[@]+"${FORWARDED_ARGS[@]}"}
+    fi
+fi
 
 BIN_LINK="$BIN_DIR/$BINARY_NAME"
 TMP_DIR=$(mktemp -d)
@@ -69,7 +184,7 @@ done
 #   3. GitHub Releases API (fallback; unauthenticated = 60 req/hr per IP)
 #
 # ~~~ BAKED_VERSION: auto-updated by CD workflow after each release — do not edit ~~~
-CUA_DRIVER_BAKED_VERSION="0.1.9"
+CUA_DRIVER_BAKED_VERSION="0.2.0"
 # ~~~ END_BAKED_VERSION ~~~
 
 if [[ -n "${CUA_DRIVER_VERSION:-}" ]]; then
@@ -193,6 +308,9 @@ fi
 #   - OpenCode  : scans ~/.config/opencode/skills/ (also reads ~/.claude/skills/
 #                 natively, so the Claude Code symlink covers OpenCode for users
 #                 who have both)
+#   - Antigravity (CLI + IDE): scans ~/.gemini/skills/ — the dir Google
+#                              inherited from Gemini CLI in May 2026, so
+#                              existing setups carry over unchanged.
 #
 # Not auto-wired (different file format / would clobber user state):
 #   - Cursor: rules use a different frontmatter shape (description/globs/
@@ -246,6 +364,15 @@ if [[ -d "$HOME/.config/opencode" ]] && [[ ! -d "$HOME/.config/opencode/skills" 
     mkdir -p "$HOME/.config/opencode/skills"
 fi
 link_skill_into "$HOME/.config/opencode/skills" "OpenCode"
+
+# Antigravity CLI (`agy`) + Antigravity IDE — both surfaces read from
+# ~/.gemini/skills (the dir inherited from Gemini CLI on 2026-05-19).
+# Create it if either Antigravity surface is installed but the skills
+# subdir hasn't been initialized yet, then link.
+if [[ -d "$HOME/.gemini" ]] && [[ ! -d "$HOME/.gemini/skills" ]]; then
+    mkdir -p "$HOME/.gemini/skills"
+fi
+link_skill_into "$HOME/.gemini/skills" "Antigravity"
 
 # --- PATH setup ---------------------------------------------------------
 #
@@ -315,16 +442,16 @@ Next steps:
      B. As an MCP server — run the one matching your client. Each is also
         available via 'cua-driver mcp-config --client <name>':
 
-        • Claude Code:
-            claude mcp add --transport stdio cua-driver -- $BIN_LINK mcp
+        • Claude Code (computer-use compatibility mode — recommended):
+            cua-driver mcp-config --client claude
+          Copy-paste the printed command into your shell — it uses
+          \`claude mcp add-json\` so the long flag survives PowerShell's
+          arg parser. This grounds Claude Code's vision/computer-use-style
+          flow on CuaDriver window screenshots — keeps the normal CuaDriver
+          tools, changes only the screenshot tool.
 
-          Claude Code computer-use compatibility mode:
-            claude mcp add --transport stdio cua-computer-use -- $BIN_LINK mcp --claude-code-computer-use-compat
-          Use this when you want Claude Code's vision/computer-use-style flow
-          to ground on CuaDriver window screenshots. It keeps the normal
-          CuaDriver tools and changes only the screenshot tool.
-          Use MCP for this path; CLI screenshots do not expose the
-          mcp__cua-computer-use__screenshot tool name cue.
+          Plain Claude Code (no computer-use compat):
+            claude mcp add --transport stdio cua-driver -- $BIN_LINK mcp
 
         • Codex (OpenAI):
             codex mcp add cua-driver -- $BIN_LINK mcp
@@ -345,10 +472,11 @@ Next steps:
             }
             Or inside gh copilot chat: /mcp add → type=STDIO, command=$BIN_LINK, args=mcp
 
-        • Cursor / OpenCode / Hermes (no add CLI — paste config):
-            cua-driver mcp-config --client cursor     # JSON for ~/.cursor/mcp.json
-            cua-driver mcp-config --client opencode   # JSON for opencode.json
-            cua-driver mcp-config --client hermes     # YAML for ~/.hermes/config.yaml
+        • Cursor / OpenCode / Hermes / Antigravity (no add CLI — paste config):
+            cua-driver mcp-config --client cursor       # JSON for ~/.cursor/mcp.json
+            cua-driver mcp-config --client opencode     # JSON for opencode.json
+            cua-driver mcp-config --client hermes       # YAML for ~/.hermes/config.yaml
+            cua-driver mcp-config --client antigravity  # JSON for ~/.gemini/config/mcp_config.json (shared with Antigravity IDE)
 
         For other clients accepting the generic mcpServers shape:
             cua-driver mcp-config
