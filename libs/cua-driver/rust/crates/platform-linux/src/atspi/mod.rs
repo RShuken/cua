@@ -26,6 +26,12 @@ pub struct AtspiNode {
     /// For pyatspi path: element_key = element_index as u64.
     /// For X11 fallback: element_key = xid.
     pub element_key: u64,
+    /// Depth in the markdown tree (0 = top-level window child).
+    /// Defaults to 0 when not tracked (e.g. X11 fallback path).
+    pub depth: usize,
+    /// `element_index` of the nearest actionable ancestor, if any.
+    /// Mirrors what the markdown indent shows.
+    pub parent_element_index: Option<usize>,
 }
 
 pub struct AtspiTreeResult {
@@ -36,8 +42,22 @@ pub struct AtspiTreeResult {
 /// Walk the AT-SPI tree for a window identified by (pid, xid).
 /// Falls back to a minimal X11 property tree if AT-SPI is unavailable.
 pub fn walk_tree(pid: u32, xid: u64, query: Option<&str>) -> AtspiTreeResult {
+    walk_tree_bounded(pid, xid, query, None, None)
+}
+
+/// Walk the AT-SPI tree with caller-supplied caps. `None` for either cap
+/// means "use the walker's built-in default" (5 000 nodes; unlimited depth).
+/// Issue #22865: caps protect against Electron / large web apps that
+/// produce 10k+ element trees and blow context windows.
+pub fn walk_tree_bounded(
+    pid: u32,
+    xid: u64,
+    query: Option<&str>,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+) -> AtspiTreeResult {
     // Native AT-SPI (most complete).
-    if let Ok(Some((raw_md, nodes))) = native::walk_tree(pid) {
+    if let Ok(Some((raw_md, nodes))) = native::walk_tree_bounded(pid, max_elements, max_depth) {
         if !raw_md.is_empty() {
             let md = if let Some(q) = query { filter_tree(&raw_md, q) } else { raw_md };
             return AtspiTreeResult { tree_markdown: md, nodes };
@@ -133,13 +153,21 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
     native::insert_text(pid, text)
 }
 
+/// Classify what holds keyboard focus so `type_text` can target the focused
+/// widget (the thing just clicked) instead of the first editable anywhere:
+/// `Some(true)` = focused editable, `Some(false)` = focused non-editable input
+/// (spreadsheet cell, terminal, canvas), `None` = nothing focused / unreachable.
+pub fn focused_is_editable(pid: u32) -> Result<Option<bool>> {
+    native::focused_is_editable(pid)
+}
+
 /// Get the screen-coordinate bounding box (x, y, width, height) of element `idx`.
 /// Screen-coordinate bounds for every action node in pid's AT-SPI tree, keyed
 /// by `element_index`. Best-effort: nodes whose bounds can't be read are
 /// omitted rather than erroring the whole call. Returns `(element_index, x, y,
 /// width, height)` tuples in screen coordinates.
-pub fn get_all_element_bounds(pid: u32) -> Result<Vec<(usize, i32, i32, u32, u32)>> {
-    native::get_all_element_bounds(pid)
+pub fn get_all_element_bounds(pid: u32, xid: u64) -> Result<Vec<(usize, i32, i32, u32, u32)>> {
+    native::get_all_element_bounds(pid, xid)
 }
 
 pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
@@ -178,6 +206,8 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         description: if wm_class.is_empty() { None } else { Some(wm_class.clone()) },
         actions: vec!["activate".into()],
         element_key: xid,
+        depth: 0,
+        parent_element_index: None,
     };
     md.push_str(&format!("- [0] window \"{}\" [actions=[activate]]\n", title));
     nodes.push(root_node);
