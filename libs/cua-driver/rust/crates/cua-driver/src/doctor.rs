@@ -212,25 +212,14 @@ fn probe_home_dir() -> Probe {
     )
 }
 
-/// Probe: telemetry state — env-var opt-out + install-id file presence.
-/// Reports without reading the UUID itself (privacy-preserving — only
-/// presence, not value).
+/// Probe the same effective persisted/environment state as `telemetry status`.
 fn probe_telemetry() -> Probe {
-    let env_disabled = std::env::var("CUA_DRIVER_RS_TELEMETRY_ENABLED")
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
-        .unwrap_or(false);
-    let install_id_present = home_dir()
-        .map(|h| h.join(".cua-driver").join(".telemetry_id").exists())
-        .unwrap_or(false);
-    if env_disabled {
-        Probe::ok(
-            "telemetry",
-            "disabled via CUA_DRIVER_RS_TELEMETRY_ENABLED",
-        )
+    let status = crate::telemetry::status();
+    if status.enabled {
+        let identity = if status.installation_id_present { "install-id present" } else { "install-id not yet generated" };
+        Probe::ok("telemetry", format!("enabled via {} ({identity})", status.source))
     } else {
-        let id_state = if install_id_present { "install-id present" } else { "install-id not yet generated" };
-        Probe::ok("telemetry", format!("enabled ({id_state})"))
+        Probe::ok("telemetry", format!("disabled via {} (installation ID retained)", status.source))
     }
 }
 
@@ -253,7 +242,8 @@ fn append_platform_probes(report: &mut Report) {
     // attached WindowStation+Desktop, which silently breaks every
     // window-driving tool. Surface the misconfiguration directly so users
     // don't waste hours debugging tools that are working as designed.
-    let in_session_0 = match diag::current_session_id() {
+    let desktop = diag::desktop_state();
+    let in_session_0 = match desktop.session_id {
         Some(0) => {
             report.push(
                 Probe::warn(
@@ -267,32 +257,50 @@ fn append_platform_probes(report: &mut Report) {
             true
         }
         Some(sid) => {
-            match diag::interactive_desktop_check() {
-                Ok(true) => report.push(Probe::ok(
+            if desktop.has_foreground_window() {
+                report.push(Probe::ok(
                     "interactive session",
                     format!(
-                        "session {sid} has an attached interactive desktop (WinSta0 + foreground window)"
+                        "session {sid} has an attached interactive desktop ({})",
+                        desktop.summary()
                     ),
-                )),
-                Ok(false) => report.push(
+                ));
+            } else if desktop.input_desktop_is_default() {
+                report.push(
                     Probe::warn(
                         "interactive session",
                         format!(
-                            "session {sid}: WinSta0 reachable but no foreground window — desktop may be locked or no app is in the foreground"
+                            "session {sid}: Default input desktop is reachable but no window is foreground ({})",
+                            desktop.summary()
                         ),
+                    )
+                    .with_detail(
+                        "GUI tests can seed foreground by launching their focus sentinel; unattended runners should still validate that the sentinel becomes foreground.",
                     ),
-                ),
-                Err(e) => report.push(Probe::warn(
-                    "interactive session",
-                    format!("session {sid} desktop probe failed: {e}"),
-                )),
+                );
+            } else {
+                report.push(
+                    Probe::warn(
+                        "interactive session",
+                        format!(
+                            "session {sid}: input desktop is not the user Default desktop ({})",
+                            desktop.summary()
+                        ),
+                    )
+                    .with_detail(
+                        "this usually means the RDP/console session is locked or disconnected; reconnect, use tscon-to-console, or boot the disposable GUI VM with an unlocked console session.",
+                    ),
+                );
             }
             false
         }
         None => {
             report.push(Probe::warn(
                 "interactive session",
-                "ProcessIdToSessionId failed — cannot determine session id",
+                format!(
+                    "ProcessIdToSessionId failed — cannot determine session id ({})",
+                    desktop.summary()
+                ),
             ));
             false
         }

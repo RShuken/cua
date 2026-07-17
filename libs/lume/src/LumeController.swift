@@ -271,6 +271,14 @@ final class LumeController {
         }
     }
 
+    /// Validates that no disk-resize transaction is armed for a VM. Blocks
+    /// run/clone/push so an in-progress (or interrupted) resize is never raced.
+    private func validateNoPendingResize(_ vmDir: VMDirectory, name: String) throws {
+        if vmDir.hasResizeMarker() {
+            throw DiskResizeError.resizeInProgress(name)
+        }
+    }
+
     @MainActor
     public func clone(
         name: String, newName: String, sourceLocation: String? = nil, destLocation: String? = nil
@@ -292,7 +300,25 @@ final class LumeController {
 
             // Check if source VM is still being provisioned
             let sourceVmDir = try home.getVMDirectory(normalizedName, storage: actualSourceLocation)
+            guard let resizeGuard = try sourceVmDir.tryAcquireResizeGuard(exclusive: false) else {
+                throw DiskResizeError.resizeInProgress(normalizedName)
+            }
+            defer {
+                flock(resizeGuard.fileDescriptor, LOCK_UN)
+                try? resizeGuard.close()
+            }
             try validateNotProvisioning(sourceVmDir, name: normalizedName)
+            try validateNoPendingResize(sourceVmDir, name: normalizedName)
+
+            let destinationVmDir = try home.getVMDirectory(normalizedNewName, storage: destLocation)
+            guard let destinationGuard = try destinationVmDir.tryAcquireResizeGuard(exclusive: true)
+            else {
+                throw DiskResizeError.resizeInProgress(normalizedNewName)
+            }
+            defer {
+                flock(destinationGuard.fileDescriptor, LOCK_UN)
+                try? destinationGuard.close()
+            }
 
             // Get the source VM and check if it's running
             let sourceVM = try get(name: normalizedName, storage: sourceLocation)
@@ -303,12 +329,11 @@ final class LumeController {
 
             // Check if destination already exists
             do {
-                let destDir = try home.getVMDirectory(normalizedNewName, storage: destLocation)
-                if destDir.exists() {
+                if destinationVmDir.exists() {
                     Logger.error(
                         "Destination VM already exists",
                         metadata: ["destination": normalizedNewName])
-                    throw HomeError.directoryAlreadyExists(path: destDir.dir.path)
+                    throw HomeError.directoryAlreadyExists(path: destinationVmDir.dir.path)
                 }
             } catch VMLocationError.locationNotFound {
                 // Location not found is okay, we'll create it
@@ -718,13 +743,12 @@ final class LumeController {
         // Run unattended setup if config is provided
         if let config = unattendedConfig, os.lowercased() == "macos" {
             // Note: We don't write a provisioning marker for unattended setup.
-            // The VM has disk + nvram at this point, so it's "running" during
-            // the setup automation, not "provisioning".
+            // The finalized VM is patched offline, then booted briefly for SSH verification.
 
             // Wait for the installation VZVirtualMachine to fully release auxiliary storage locks.
             Logger.info("Waiting for installation resources to be released before unattended setup")
             try await Task.sleep(nanoseconds: 3_000_000_000)  // 3 seconds
-            Logger.info("Starting unattended Setup Assistant automation", metadata: ["name": name])
+            Logger.info("Starting offline unattended setup", metadata: ["name": name])
 
             // Load the finalized VM
             let finalVM = try get(name: name, storage: storage)
@@ -754,12 +778,12 @@ final class LumeController {
                 throw error
             }
 
-            Logger.info("Unattended setup completed", metadata: ["name": name])
+            Logger.info("Offline unattended setup completed", metadata: ["name": name])
         }
     }
 
 
-    /// Run unattended Setup Assistant automation on an existing macOS VM
+    /// Run offline unattended setup on an existing macOS VM
     @MainActor
     public func setup(
         name: String,
@@ -776,8 +800,8 @@ final class LumeController {
             metadata: [
                 "name": normalizedName,
                 "storage": storage ?? "home",
-                "bootWait": "\(config.bootWait)s",
-                "commands": "\(config.bootCommands.count)",
+                "config_boot_wait": "\(config.bootWait)s",
+                "config_boot_commands": "\(config.bootCommands.count)",
                 "debug": "\(debug)",
                 "debugDir": debugDir ?? "default"
             ])
@@ -798,57 +822,6 @@ final class LumeController {
             Logger.info("Unattended setup completed", metadata: ["name": normalizedName])
         } catch {
             Logger.error("Failed to run unattended setup", metadata: ["error": error.localizedDescription])
-            throw error
-        }
-    }
-
-    /// Run agent-based Setup Assistant automation using Claude computer-use API
-    @MainActor
-    public func setupWithAgent(
-        name: String,
-        apiKey: String,
-        model: String = "claude-sonnet-4-6",
-        maxIterations: Int = 100,
-        systemPrompt: String? = nil,
-        storage: String? = nil,
-        vncPort: Int = 0,
-        noDisplay: Bool = false,
-        debug: Bool = false,
-        debugDir: String? = nil
-    ) async throws {
-        let normalizedName = normalizeVMName(name: name)
-        Logger.info(
-            "Running agent-based setup",
-            metadata: [
-                "name": normalizedName,
-                "model": model,
-                "maxIterations": "\(maxIterations)",
-                "debug": "\(debug)"
-            ])
-
-        do {
-            let vm = try get(name: normalizedName, storage: storage)
-
-            guard vm.config.os.lowercased() == "macos" else {
-                throw VMError.unsupportedOS("Unattended setup is only supported for macOS VMs, got: \(vm.config.os)")
-            }
-
-            let installer = UnattendedInstaller()
-            try await installer.installWithAgent(
-                vm: vm,
-                apiKey: apiKey,
-                model: model,
-                maxIterations: maxIterations,
-                systemPrompt: systemPrompt,
-                vncPort: vncPort,
-                noDisplay: noDisplay,
-                debug: debug,
-                debugDir: debugDir
-            )
-
-            Logger.info("Agent-based setup completed", metadata: ["name": normalizedName])
-        } catch {
-            Logger.error("Failed to run agent-based setup", metadata: ["error": error.localizedDescription])
             throw error
         }
     }
@@ -883,11 +856,20 @@ final class LumeController {
                 let actualLocation = try self.validateVMExists(normalizedName, storage: storage)
                 vmDir = try home.getVMDirectory(normalizedName, storage: actualLocation)
             }
-            
+
             // Stop VM if it's running
             if SharedVM.shared.getVM(name: normalizedName) != nil {
                 try await stopVM(name: normalizedName)
             }
+
+            guard let resizeGuard = try vmDir.tryAcquireResizeGuard(exclusive: true) else {
+                throw DiskResizeError.resizeInProgress(normalizedName)
+            }
+            defer {
+                flock(resizeGuard.fileDescriptor, LOCK_UN)
+                try? resizeGuard.close()
+            }
+            try validateNoPendingResize(vmDir, name: normalizedName)
             
             try vmDir.delete()
             
@@ -908,8 +890,17 @@ final class LumeController {
         memory: UInt64? = nil,
         diskSize: UInt64? = nil,
         display: String? = nil,
-        storage: String? = nil
+        storage: String? = nil,
+        noBackup: Bool = false,
+        keepBackup: Bool = false,
+        dryRun: Bool = false
     ) throws {
+        if noBackup && keepBackup {
+            throw ValidationError("--no-backup and --keep-backup cannot be used together")
+        }
+        if diskSize == nil && (noBackup || keepBackup || dryRun) {
+            throw ValidationError("Disk-resize options require diskSize")
+        }
         let normalizedName = normalizeVMName(name: name)
         Logger.info(
             "Updating VM settings",
@@ -936,7 +927,10 @@ final class LumeController {
                 try vm.setMemorySize(memory)
             }
             if let diskSize = diskSize {
-                try vm.setDiskSize(diskSize)
+                try vm.resizeDiskSafely(
+                    to: diskSize,
+                    options: DiskResizeOptions(
+                        backup: !noBackup, keepBackup: keepBackup, dryRun: dryRun))
             }
             if let display = display {
                 try vm.setDisplay(display)
@@ -1099,6 +1093,7 @@ final class LumeController {
 
             // Check if VM is still being provisioned
             try validateNotProvisioning(vmDir, name: normalizedName)
+            try validateNoPendingResize(vmDir, name: normalizedName)
 
             // Validate parameters using the located VMDirectory
             try validateRunParameters(
@@ -1271,6 +1266,14 @@ final class LumeController {
 
             // Get the VM directory
             let vmDir = try home.getVMDirectory(name, storage: actualLocation)
+            guard let resizeGuard = try vmDir.tryAcquireResizeGuard(exclusive: false) else {
+                throw DiskResizeError.resizeInProgress(name)
+            }
+            defer {
+                flock(resizeGuard.fileDescriptor, LOCK_UN)
+                try? resizeGuard.close()
+            }
+            try validateNoPendingResize(vmDir, name: name)
 
             // Use configured registry to push the VM
             let imageRegistry = try RegistryFactory.createRegistry(

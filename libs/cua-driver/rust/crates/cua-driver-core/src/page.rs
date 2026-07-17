@@ -72,6 +72,27 @@ pub trait PageBackend: Send + Sync {
         javascript: &str,
     ) -> anyhow::Result<String>;
 
+    /// Evaluate `javascript` against an explicitly selected CDP page.
+    ///
+    /// Backends that do not expose per-page CDP routing keep their legacy
+    /// behavior only when no explicit target was requested. A supplied port
+    /// or URL hint must never be silently ignored.
+    async fn execute_javascript_targeted(
+        &self,
+        pid: i32,
+        window_id: u32,
+        javascript: &str,
+        cdp_port: Option<u16>,
+        target_url_contains: Option<&str>,
+    ) -> anyhow::Result<String> {
+        if cdp_port.is_some() || target_url_contains.is_some() {
+            anyhow::bail!(
+                "targeted execute_javascript is not implemented on this platform's page backend"
+            );
+        }
+        self.execute_javascript(pid, window_id, javascript).await
+    }
+
     /// Whether this backend can execute JS at all.  False → the tool short-
     /// circuits with a "not supported here" error; true → the backend may
     /// still return an error at call time (e.g. CDP port not reachable).
@@ -110,6 +131,77 @@ pub trait PageBackend: Send + Sync {
              (no visible cursor animation)."
         )
     }
+
+    /// Type `text` into whatever currently holds DOM focus, as a stream of
+    /// real per-character keystroke events rather than a one-shot DOM write.
+    ///
+    /// This is the durable rung for rich-text contenteditable editors
+    /// (Draft.js/Lexical/Slate-style composers) whose own state
+    /// reconciliation can silently discard a synthetic `execCommand` or
+    /// `innerText =` write on the next render — a keystroke stream is what
+    /// those editors' own input pipeline actually observes. Plain
+    /// `<input>`/`<textarea>` fields don't need this; `execute_javascript`
+    /// with `el.value = ...` + a dispatched `input` event is cheaper there.
+    ///
+    /// Caller is responsible for focusing the target element first (e.g. a
+    /// prior `click_element` or `execute_javascript` with `el.click()`).
+    ///
+    /// Default impl returns an actionable "not implemented" error so
+    /// backends without a keystroke-capable path keep compiling.
+    /// `cdp_port`, when given, is used directly instead of auto-discovering
+    /// a port from `pid` — needed when auto-discovery can't confirm the
+    /// port itself (e.g. a CDP endpoint opened via the browser's own
+    /// "allow remote debugging" toggle on an already-running profile,
+    /// rather than a launch-time flag; that endpoint may not answer the
+    /// classic `/json` probe auto-discovery relies on).
+    ///
+    /// `target_url_contains`, when given, picks the browser tab whose URL
+    /// contains this substring instead of whichever tab the backend finds
+    /// first — needed on a multi-tab browser, since there's no built-in
+    /// relationship between `window_id` and which tab a CDP call reaches.
+    async fn type_keystrokes(
+        &self,
+        _pid: i32,
+        _window_id: u32,
+        _text: &str,
+        _cdp_port: Option<u16>,
+        _target_url_contains: Option<&str>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!(
+            "type_keystrokes is not implemented on this platform's page \
+             backend. Fall back to execute_javascript with \
+             document.execCommand('insertText', ...) for plain inputs."
+        )
+    }
+
+    /// Insert `text` at whatever currently holds DOM focus in a single
+    /// operation — no synthesized key events, but (unlike a JS-level
+    /// `execCommand`/`innerText =` write) it's a native input-pipeline
+    /// operation the browser treats similarly to an IME composition commit,
+    /// which rich-text editors already have to handle correctly. Cheaper
+    /// than `type_keystrokes` and often durable enough on its own; escalate
+    /// to `type_keystrokes` only if this rung's write still gets discarded
+    /// or the editor needs to observe real keydown/keyup events.
+    ///
+    /// Caller is responsible for focusing the target element first.
+    /// `cdp_port` — see `type_keystrokes`.
+    ///
+    /// Default impl returns an actionable "not implemented" error so
+    /// backends without this path keep compiling.
+    async fn insert_text(
+        &self,
+        _pid: i32,
+        _window_id: u32,
+        _text: &str,
+        _cdp_port: Option<u16>,
+        _target_url_contains: Option<&str>,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!(
+            "insert_text is not implemented on this platform's page backend. \
+             Fall back to execute_javascript with \
+             document.execCommand('insertText', ...), or type_keystrokes."
+        )
+    }
 }
 
 /// The cross-platform `page` MCP tool.  Holds a backend trait object the
@@ -140,6 +232,17 @@ fn def() -> &'static ToolDef {
               to its on-screen center first (so the user sees what the agent is doing). \
               Prefer over `execute_javascript('el.click()')` whenever you want visible \
               cursor feedback.\n\
+            - insert_text: Insert `text` at whatever currently holds DOM focus in one \
+              native operation (CDP Input.insertText) — no synthesized key events, but \
+              more durable than a one-shot execute_javascript write since rich-text \
+              editors already have to treat it like an IME commit. Try this before \
+              type_keystrokes on a contenteditable that discarded an execute_javascript \
+              write. Click/focus the target field first.\n\
+            - type_keystrokes: Type `text` via real per-character keystroke events into \
+              whatever currently holds DOM focus. Slower than insert_text but the most \
+              durable rung — use it when insert_text also gets discarded, or the editor's \
+              own keydown/keyup handlers need to see real keys. Click/focus the target \
+              field first.\n\
             - enable_javascript_apple_events: macOS-only — patch the browser's \
               Preferences to allow JS from Apple Events (Chrome/Brave/Edge, requires user \
               confirmation and a browser restart).".into(),
@@ -156,12 +259,26 @@ fn def() -> &'static ToolDef {
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
                 "action": {
                     "type": "string",
-                    "enum": ["execute_javascript", "get_text", "query_dom", "click_element", "enable_javascript_apple_events"],
+                    "enum": ["execute_javascript", "get_text", "query_dom", "click_element", "insert_text", "type_keystrokes", "enable_javascript_apple_events"],
                     "description": "Action to perform."
                 },
                 "selector": {
                     "type": "string",
                     "description": "CSS selector for click_element (e.g. 'button.submit', '#login a')."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to insert or type. Required for insert_text and type_keystrokes. The target field must already have DOM focus (click/focus it first)."
+                },
+                "cdp_port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535,
+                    "description": "Optional, for execute_javascript/insert_text/type_keystrokes: use this exact CDP port instead of auto-discovering one from pid. Needed when the port was opened via the browser's own remote-debugging toggle rather than a launch-time flag, since that path may not answer the auto-discovery probe."
+                },
+                "target_url_contains": {
+                    "type": "string",
+                    "description": "Optional, for execute_javascript/insert_text/type_keystrokes: require exactly one browser tab whose URL contains this substring. Use this on a multi-tab browser — there's no built-in link between window_id and which tab a CDP call reaches."
                 },
                 "javascript": {
                     "type": "string",
@@ -280,7 +397,23 @@ impl Tool for PageTool {
                     Some(v) => v.to_owned(),
                     None => return ToolResult::error("Missing required parameter: javascript"),
                 };
-                match self.backend.execute_javascript(pid, window_id, &js).await {
+                let cdp_port = match optional_cdp_port(&args) {
+                    Ok(value) => value,
+                    Err(error) => return ToolResult::error(error),
+                };
+                let target_url_contains =
+                    args.get("target_url_contains").and_then(|v| v.as_str());
+                match self
+                    .backend
+                    .execute_javascript_targeted(
+                        pid,
+                        window_id,
+                        &js,
+                        cdp_port,
+                        target_url_contains,
+                    )
+                    .await
+                {
                     Ok(result) => ToolResult::text(result),
                     Err(e) => ToolResult::error(format!("{e}")),
                 }
@@ -321,6 +454,38 @@ impl Tool for PageTool {
                 }
             }
 
+            "insert_text" => {
+                let text = match args.get("text").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_owned(),
+                    None => return ToolResult::error("Missing required parameter: text"),
+                };
+                let cdp_port = match optional_cdp_port(&args) {
+                    Ok(value) => value,
+                    Err(error) => return ToolResult::error(error),
+                };
+                let target_url_contains = args.get("target_url_contains").and_then(|v| v.as_str());
+                match self.backend.insert_text(pid, window_id, &text, cdp_port, target_url_contains).await {
+                    Ok(msg) => ToolResult::text(msg),
+                    Err(e) => ToolResult::error(format!("insert_text failed: {e}")),
+                }
+            }
+
+            "type_keystrokes" => {
+                let text = match args.get("text").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_owned(),
+                    None => return ToolResult::error("Missing required parameter: text"),
+                };
+                let cdp_port = match optional_cdp_port(&args) {
+                    Ok(value) => value,
+                    Err(error) => return ToolResult::error(error),
+                };
+                let target_url_contains = args.get("target_url_contains").and_then(|v| v.as_str());
+                match self.backend.type_keystrokes(pid, window_id, &text, cdp_port, target_url_contains).await {
+                    Ok(msg) => ToolResult::text(msg),
+                    Err(e) => ToolResult::error(format!("type_keystrokes failed: {e}")),
+                }
+            }
+
             "query_dom" => {
                 let selector = args
                     .get("css_selector")
@@ -348,5 +513,139 @@ impl Tool for PageTool {
 
             other => ToolResult::error(format!("Unknown action: {other}")),
         }
+    }
+}
+
+fn optional_cdp_port(args: &Value) -> Result<Option<u16>, String> {
+    let Some(value) = args.get("cdp_port") else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| "Invalid parameter: cdp_port must be an integer from 1 to 65535".to_owned())?;
+    let port = u16::try_from(raw)
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("Invalid parameter: cdp_port {raw} outside 1..=65535"))?;
+    Ok(Some(port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    type TargetedCall = (i32, u32, String, Option<u16>, Option<String>);
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        targeted: Mutex<Option<TargetedCall>>,
+    }
+
+    #[async_trait]
+    impl PageBackend for RecordingBackend {
+        async fn get_text(&self, _pid: i32, _window_id: u32) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn query_dom(
+            &self,
+            _pid: i32,
+            _window_id: u32,
+            _css_selector: &str,
+            _attributes: &[String],
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn execute_javascript(
+            &self,
+            _pid: i32,
+            _window_id: u32,
+            _javascript: &str,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("untargeted execute must not be used")
+        }
+
+        async fn execute_javascript_targeted(
+            &self,
+            pid: i32,
+            window_id: u32,
+            javascript: &str,
+            cdp_port: Option<u16>,
+            target_url_contains: Option<&str>,
+        ) -> anyhow::Result<String> {
+            *self.targeted.lock().unwrap() = Some((
+                pid,
+                window_id,
+                javascript.to_owned(),
+                cdp_port,
+                target_url_contains.map(str::to_owned),
+            ));
+            Ok("targeted".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_javascript_forwards_explicit_page_target() {
+        let backend = Arc::new(RecordingBackend::default());
+        let tool = PageTool::new(backend.clone());
+
+        let result = tool
+            .invoke(serde_json::json!({
+                "pid": 42,
+                "window_id": 7,
+                "action": "execute_javascript",
+                "javascript": "document.title",
+                "cdp_port": 9333,
+                "target_url_contains": "#window-b"
+            }))
+            .await;
+
+        assert!(result.is_error.is_none());
+        assert_eq!(
+            *backend.targeted.lock().unwrap(),
+            Some((
+                42,
+                7,
+                "document.title".to_owned(),
+                Some(9333),
+                Some("#window-b".to_owned()),
+            ))
+        );
+    }
+
+    #[test]
+    fn schema_advertises_targeted_execute_javascript() {
+        let schema = &def().input_schema["properties"];
+        assert_eq!(schema["cdp_port"]["minimum"], 1);
+        assert_eq!(schema["cdp_port"]["maximum"], 65535);
+        assert!(schema["cdp_port"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("execute_javascript"));
+        assert!(schema["target_url_contains"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn rejects_out_of_range_cdp_port_before_dispatch() {
+        let backend = Arc::new(RecordingBackend::default());
+        let tool = PageTool::new(backend.clone());
+
+        let result = tool
+            .invoke(serde_json::json!({
+                "pid": 42,
+                "window_id": 7,
+                "action": "execute_javascript",
+                "javascript": "document.title",
+                "cdp_port": 65536
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(backend.targeted.lock().unwrap().is_none());
     }
 }

@@ -1,17 +1,62 @@
 # Driving web-rendered apps
 
-> **Platform: macOS-only.** This doc covers AX-tree quirks, AppleScript
+## Prefer the typed browser tools for Chromium page mutation
+
+For Chrome, Edge, Brave, and Electron, use the first-class browser workflow
+before legacy `page`, AX, or pixel mutation when a DevTools endpoint is
+available:
+
+1. Start a named driver session.
+2. Select the exact native `(pid, window_id)` from `launch_app` or
+   `list_windows`.
+3. Bind with `get_browser_state({pid, window_id, session})`. Continue only when
+   `binding_quality` is `exact`.
+4. Snapshot with `get_browser_state({target_id, tab_id, session})`.
+5. Use the returned current ref with `browser_click` or `browser_type`, or use
+   `browser_navigate` for a URL.
+6. Re-snapshot after navigation and whenever a call reports
+   `browser_ref_stale`. End the session when done.
+
+If binding reports `browser_requires_setup`, use the separately approved
+`browser_prepare` tool with `allow_launch:true` and
+`profile:{mode:"isolated_new"}`. It returns a new `prepared_pid`; select that
+process's window and bind again. Do not pass remote-debugging flags through
+`launch_app`: the driver rejects that route so an agent cannot expose a user's
+normal profile accidentally. MCP hosts approve the destructive prepare call;
+direct/raw clients first mint a single-use token with the interactive
+`cua-driver browser-approve` command.
+
+This is the page-aware Chromium rung. Navigation, default ref-bound text
+insertion, and an explicit DOM click can run against an exactly bound page
+without raising its native window. `browser_click` defaults to trusted
+`Input.dispatchMouseEvent`: standalone Windows has passing background evidence,
+while standalone macOS and Linux return `browser_input_trust_unavailable`
+before dispatch because Chromium activates its window on that route. Embedded
+Electron has a separately proven bounded route. Use
+`input_route:"dom_event"` only when a synthetic DOM click is explicitly
+acceptable. Target ids, tab ids, and refs are opaque session capabilities, not
+raw CDP ids.
+
+Refs traverse open shadow roots and same-process frames. Out-of-process frames
+are included only when the runtime exposes an independently attached CDP
+session; otherwise the frame is reported as a limitation. The legacy guidance
+below remains relevant for Safari, Firefox, browser chrome, and surfaces where
+exact browser binding is unavailable.
+
+> **Most legacy guidance below is macOS-specific.** It covers AX-tree quirks, AppleScript
 > JavaScript bridges, and Chromium / WebKit / Electron / Tauri patterns
 > on macOS. For Windows web-app automation (Edge, Chrome with
 > PostMessage / WebView2), see `WINDOWS.md` → "Web apps on Windows". For
 > Linux: `LINUX.md` (the cross-platform `page` tool below uses AT-SPI
-> + CDP the same way).
+>
+> - CDP the same way).
 >
 > The `page` tool itself is **cross-platform** — Windows + Linux back
 > `get_text` / `query_dom` with UIA / AT-SPI respectively, and
-> `execute_javascript` on those platforms uses CDP (browser must be
-> launched with `--remote-debugging-port=N`, with the port exposed via
-> the `CUA_DRIVER_CDP_PORT` env var). macOS routing (this doc) remains
+> `execute_javascript` on those platforms uses CDP (the endpoint may be
+> supplied by a test-owned fixture or a driver-owned browser prepared through
+> `browser_prepare`; legacy callers can expose its port via
+> `CUA_DRIVER_CDP_PORT`). macOS routing (this doc) remains
 > Apple Events → CDP → AX-tree fallback.
 
 Covers apps whose UI is rendered in a web runtime inside a native
@@ -58,7 +103,7 @@ pixels:
    (often AX-exposed), toolbar buttons in the window chrome.
 2. Use keyboard shortcuts delivered straight to the pid —
    `hotkey({pid, keys: ["cmd", "enter"]})`, `hotkey({pid, keys:
-   ["cmd", "k"]})`, etc. Posted via `CGEvent.postToPid`, reaches the
+["cmd", "k"]})`, etc. Posted via `CGEvent.postToPid`, reaches the
    target regardless of AX state, no activation required.
 3. For typing into web inputs, use `type_text` — it automatically
    falls back to CGEvent synthesis when the input doesn't implement
@@ -117,6 +162,7 @@ itself honors.
 
 Minor caveats for the rare case a `⌘L` flow is still needed
 (last-resort only, with user buy-in on the focus flash):
+
 - Don't drop `delay_ms` below ~25 for keystroked typing on
   Chromium — below that, autocomplete insertions interleave with
   your characters and you get garbage like `"exuample.comn"`
@@ -154,7 +200,7 @@ in a specific tab" (rare).
 tab-strip in the AX tree for `AXTab` / `AXRadioButton` elements
 and read their `AXTitle`s. You can discover which tabs exist and
 what URLs/titles they carry without switching to any of them.
-Only *activating* a specific tab is visible.
+Only _activating_ a specific tab is visible.
 
 ## Keyboard commits on minimized windows
 
@@ -255,14 +301,14 @@ the target is AX-addressable.
 
 ## Enable "Allow JavaScript from Apple Events" — browser support matrix
 
-| Browser | `execute javascript` supported | Setting needed | Programmatic path |
-|---|---|---|---|
-| Chrome | ✅ Full | ✅ Yes | Edit Preferences JSON (see below) |
-| Brave | ✅ Full | ✅ Yes | Edit Preferences JSON (same key, different path) |
-| Edge | ✅ Full | ✅ Yes | Edit Preferences JSON (same key, different path) |
-| Safari | ✅ Full (`do JavaScript`) | ✅ Yes | UI automation only — `defaults write` broken |
-| Arc | ⚠️ No return values | No toggle | No reliable path |
-| Firefox | ❌ Not supported | N/A | N/A |
+| Browser | `execute javascript` supported | Setting needed | Programmatic path                                |
+| ------- | ------------------------------ | -------------- | ------------------------------------------------ |
+| Chrome  | ✅ Full                        | ✅ Yes         | Edit Preferences JSON (see below)                |
+| Brave   | ✅ Full                        | ✅ Yes         | Edit Preferences JSON (same key, different path) |
+| Edge    | ✅ Full                        | ✅ Yes         | Edit Preferences JSON (same key, different path) |
+| Safari  | ✅ Full (`do JavaScript`)      | ✅ Yes         | UI automation only — `defaults write` broken     |
+| Arc     | ⚠️ No return values            | No toggle      | No reliable path                                 |
+| Firefox | ❌ Not supported               | N/A            | N/A                                              |
 
 ### Chrome / Brave / Edge — Preferences JSON
 
@@ -483,3 +529,175 @@ If it silently drops (some web inputs don't implement
 synthesis — pure CGEvent keystrokes delivered to the pid, reaching
 any focused keyboard receiver. You can also click the field first
 to ensure focus before typing.
+
+### `escalation.recommended == "page"` — stop typing, switch tools
+
+On a rich-text contenteditable driven by React/Draft.js (X's tweet
+composer is the canonical example), CGEvent keystroke synthesis is
+fundamentally racy: a combined px-click-then-type call can drop or
+reorder the first character, and `hotkey(["cmd","a"])` / `press_key
+delete` frequently no-op against the editor's own selection model.
+`type_text` knows this and says so — when its response includes
+`escalation: {recommended: "page", reason: "...AX type_text on a
+contenteditable is racy..."}`, that is your cue to **stop iterating
+on the keyboard ladder immediately.** Do not retry with
+`delivery_mode:"foreground"`, do not triple-click to select, do not
+try `cmd+a`+`delete` first — every one of those is the wrong rung.
+Go straight to the `page` tool instead:
+
+```
+page({pid, window_id, action: "execute_javascript", javascript: `
+  (function() {
+    var el = document.querySelector('[data-testid="tweetTextarea_0"]');
+    el.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('delete', false, null);
+    document.execCommand('insertText', false, ${JSON.stringify(text)});
+    return el.innerText;
+  })()
+`})
+```
+
+`document.execCommand('insertText', ...)` dispatches the real
+`beforeinput`/`input` events Draft.js/React listen for, so it lands
+in the framework's own state — not just a raw DOM mutation the
+framework will stomp on next render. Swap the selector for whatever
+`[data-testid]`/`role="textbox"` the target editor uses; find it via
+`page(query_dom)` first if unfamiliar with the site.
+
+**Verification gotcha:** if the window is occluded or off-screen
+when you re-snapshot, `get_window_state`'s screenshot can return a
+stale cached frame while the DOM has actually already updated —
+`list_windows` showing `is_on_screen: false` for the target is the
+tell. Don't conclude the insert failed off a stale screenshot; verify
+with a follow-up `page(execute_javascript)` reading `el.innerText`
+directly, which reads the live DOM regardless of on-screen state.
+
+**`execCommand` is not durable on editors that reconcile their own
+state.** Confirmed on X's composer: `insertText` lands in the DOM
+immediately (verified via `el.innerText` right after), but a later
+background re-render of the surrounding page (e.g. the timeline
+polling in new posts) can silently wipe it back to empty — because
+it was one synthetic event, not something the editor's own input
+pipeline ever actually observed as a keystroke. If you see the text
+vanish on a follow-up read with no error anywhere, that's this,
+not a transient bug — reach for `insert_text` or `type_keystrokes`
+(below) instead of retrying `execCommand` in a loop.
+
+### `insert_text` — a cheaper, more durable middle rung
+
+**macOS-only for now.** Windows and Linux don't yet implement the CDP
+`Input.insertText`/`Input.dispatchKeyEvent` calls this and
+`type_keystrokes` need — both return a clean "not implemented" error
+there, not a silent no-op. Tracked in
+[trycua/cua#2084](https://github.com/trycua/cua/issues/2084). Every
+other `page` action (`get_text`, `query_dom`, `click_element`,
+`execute_javascript`) works cross-platform.
+
+```
+page({pid, window_id, action: "insert_text", text: "…"})
+```
+
+Inserts `text` at the focused element in a single CDP
+`Input.insertText` call — no synthesized keydown/keyup sequence, so
+it's one round-trip instead of three-per-character. It's still more
+durable than `execCommand`, though, because Chrome's renderer treats
+it like an IME composition commit rather than a JS-triggered DOM
+mutation, and rich editors already have to handle real IME commits
+correctly (CJK input, etc.) — so they're less likely to treat it as
+untrusted and discard it. It does skip real key events, so an
+editor's own keydown/keyup handlers (shortcut bindings, per-key
+validation) never fire for it.
+
+Try this before `type_keystrokes` when `execCommand` got discarded.
+Escalate to `type_keystrokes` only if `insert_text` also gets wiped,
+or the editor specifically needs to observe real keystrokes.
+
+Same preconditions as `type_keystrokes` below (focus + live CDP
+port on a non-default profile).
+
+### `type_keystrokes` — the slowest, most durable rung
+
+```
+page({pid, window_id, action: "type_keystrokes", text: "…"})
+```
+
+Types `text` as a stream of real per-character keyboard events
+(`Input.dispatchKeyEvent`: keyDown → char → keyUp per character) via
+the Chrome DevTools Protocol, rather than one synthetic DOM write.
+This is what makes it durable against React/Draft.js/Lexical/Slate
+editors that reconcile their own internal model on every render —
+they only trust input their own keydown/keypress/input pipeline
+actually saw, and `execCommand`/`innerText =` never touches that
+pipeline. Slower than `insert_text` (3 CDP round-trips per
+character, with a small inter-character delay) — reach for it only
+after `insert_text` didn't stick, or the editor needs real keydown
+events.
+
+Preconditions (shared with `insert_text`):
+
+- The target element must already have DOM focus — click it first
+  (`page(click_element)` or `execute_javascript` with `el.click()` /
+  `el.focus()`).
+- The browser needs a live CDP port. Two supported sources are:
+  - **Driver-owned automation profile** — call the approved
+    `browser_prepare` operation with `allow_launch:true` and an
+    `isolated_new` or `isolated_named` profile. It launches a separate
+    process and returns `prepared_pid`. It never copies or modifies the
+    user's normal profile.
+  - **The user's real, already-logged-in Chrome** — have them open
+    `chrome://inspect/#remote-debugging` and check "Allow remote
+    debugging". Confirmed this opens a CDP port on the _default_
+    profile without relaunching anything, but it doesn't serve the
+    classic `/json` HTTP discovery (confirmed `/json/version` returns 404) — `insert_text`/`type_keystrokes` fall back automatically to
+    connecting straight to the browser-level `ws://host:port/devtools/browser`
+    endpoint and `Target.attachToTarget{flatten:true}` in that case,
+    but since that path can't be auto-discovered via `pid` + `lsof`
+    (no working `/json` to validate against), pass the port explicitly
+    via the legacy `cdp_port` argument (commonly 9222, but whatever the chrome://inspect
+    page shows) — auto-discovery only works for the dedicated-profile
+    route above.
+    **This can't be made fully unattended, and the popup fires more
+    often than you'd think.** Chrome shows a live "Allow remote
+    debugging?" confirmation on every _new_ WebSocket connection to the
+    browser endpoint — not once per Chrome process, and NOT something a
+    saved preference can skip. Confirmed by testing live, twice, with
+    different results depending on what actually opened a new socket:
+    - Naively calling `insert_text`/`type_keystrokes` fresh each time
+      (each one connecting from scratch) got prompted on **every single
+      call, 3 for 3** — worse than "once per session."
+    - `CdpSessionCache` (this platform's backend) fixes that: it caches
+      one open connection per port and reuses it across calls,
+      re-attaching to a different tab on the _same_ connection via
+      `Target.getTargets`/`Target.attachToTarget` when
+      `target_url_contains` points somewhere new — flattened-mode
+      re-attach doesn't open a new socket, so it doesn't re-prompt.
+      Confirmed live: after the first approval, two more calls (typing
+      into the same tab) went through silently in well under a second.
+    - The popup _does_ come back the moment the cache has to open a
+      genuinely new connection — confirmed by closing the tab the
+      cached session was attached to: the next call took ~2s (evict +
+      reconnect) and needed a fresh click. Also expect this after a
+      full Chrome restart, or a daemon restart (the cache is in-memory,
+      not persisted).
+      Net: one click to start, silent after that for as long as the
+      browser and the daemon both stay up and you're re-attaching rather
+      than reconnecting — but don't promise a caller "no more prompts,
+      ever" for a long session that outlives either of those.
+      If no CDP port is found (and none was given explicitly), both
+      actions fail fast with an actionable error rather than silently
+      no-op'ing.
+- Multi-tab ambiguity: with more than one tab open, both actions act
+  on whichever tab is found first — not necessarily the one you
+  mean — unless you pass `target_url_contains` (a substring to match
+  against the tab's URL, e.g. `"x.com/compose"`). Always pass this when
+  the browser might have more than one tab open, which in practice is
+  every real, non-disposable-profile session. Be as specific as the
+  URL allows — `"x.com"` alone matched BOTH a compose tab and a
+  notifications tab in testing, and `pick_target` just took whichever
+  came first; `"x.com/compose"` was needed to disambiguate.
+
+Prefer `execCommand` first for plain `<input>`/`<textarea>` fields
+(cheaper, no CDP-port precondition); reach for `type_keystrokes`
+specifically when `execCommand` landed but didn't stick, or when
+you're driving a known rich-text composer up front.

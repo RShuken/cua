@@ -28,15 +28,17 @@ use std::process::{Command, ExitStatus};
 /// constant from triggering `dead_code` on the platform that doesn't use it.
 #[cfg(not(windows))]
 const CANONICAL_INSTALL_SH: &str =
-    "https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh";
+    "https://cua.ai/driver/install.sh";
 #[cfg(windows)]
 const CANONICAL_INSTALL_PS1: &str =
-    "https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1";
+    "https://cua.ai/driver/install.ps1";
 
 /// The env var both scripts honour to pin the target release tag. Set to a
 /// bare version like `"0.2.18"` (no `cua-driver-rs-v` prefix). See
 /// `libs/cua-driver/scripts/_install-rust.sh` + `install.ps1`.
 const VERSION_PIN_ENV: &str = "CUA_DRIVER_RS_VERSION";
+const INSTALL_CHANNEL_ENV: &str = "CUA_DRIVER_INSTALL_CHANNEL";
+const RELEASE_VERSION_ENV: &str = "CUA_DRIVER_RELEASE_VERSION";
 
 /// Invoke the canonical installer pinned to `version`. Returns the
 /// installer's exit status so the caller can produce the right
@@ -52,6 +54,8 @@ pub fn run_install_script(version: &str) -> std::io::Result<ExitStatus> {
         let pwsh_cmd = format!("iwr -useb {CANONICAL_INSTALL_PS1} | iex");
         Command::new("powershell.exe")
             .env(VERSION_PIN_ENV, version)
+            .env(INSTALL_CHANNEL_ENV, "update_apply")
+            .env(RELEASE_VERSION_ENV, version)
             .args([
                 "-NoProfile",
                 "-ExecutionPolicy",
@@ -69,6 +73,8 @@ pub fn run_install_script(version: &str) -> std::io::Result<ExitStatus> {
         let bash_cmd = format!("curl -fsSL {CANONICAL_INSTALL_SH} | bash");
         Command::new("bash")
             .env(VERSION_PIN_ENV, version)
+            .env(INSTALL_CHANNEL_ENV, "update_apply")
+            .env(RELEASE_VERSION_ENV, version)
             .args(["-c", &bash_cmd])
             .status()
     }

@@ -1,1 +1,19 @@
-{ "title": "Cua Driver", "pages": ["cli-reference", "mcp-tools", "limits"] }
+{
+  "title": "Cua Driver",
+  "pages": [
+    "cli-reference",
+    "telemetry",
+    "macos-permissions",
+    "embedding",
+    "mcp-tools",
+    "mcp-tool-notes",
+    "action-selection-policy",
+    "permission-policies",
+    "contracts",
+    "platform-support",
+    "platform-roadmap",
+    "process-model",
+    "limits",
+    "development"
+  ]
+}

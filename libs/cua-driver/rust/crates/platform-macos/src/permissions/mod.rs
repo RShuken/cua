@@ -23,4 +23,18 @@ pub mod status;
 pub mod panel;
 
 pub use status::{PermissionsStatus, current_status};
-pub use gate::{GateOpts, MissingPermission, run_if_needed};
+pub use gate::{
+    GateOpts, GateProgress, MissingPermission, run_if_needed, run_if_needed_with_observer,
+};
+
+/// Crate-wide lock serializing tests that mutate process-global env vars.
+/// Per-module locks are not enough: `gate` and `check_permissions` tests
+/// share `CUA_DRIVER_EMBEDDED`.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    // Poison carries no stale invariant (tests restore the vars they touch).
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}

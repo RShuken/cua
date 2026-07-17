@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# cua-driver uninstaller (Rust implementation by default, retired Swift
-# driver as an explicit legacy path on macOS). Mirrors uninstall.ps1 on
+# cua-driver uninstaller (Rust implementation only). Mirrors uninstall.ps1 on
 # Windows: one canonical script per shell, no private `_uninstall-rust.sh`
 # helper.
 #
 # Behaviour by host + flag:
-#   macOS/Linux + no flag           → Rust uninstall
-#   macOS  + --backend=swift        → retired Swift uninstall
-#   macOS  + --experimental-rust    → same as no flag (legacy alias)
-#   macOS  + --backend=rust         → same as no flag
-#   Linux/other + --backend=swift   → no-op (still allowed for compatibility)
+#   all hosts + no flag             → Rust uninstall
+#   --backend=rust/swift            → no-op (Rust is the only supported backend)
+#   --experimental-rust             → legacy alias (no-op)
 #
 # Swift uninstall removes:
 #   - ~/.local/bin/cua-driver symlink (+ legacy /usr/local/bin/cua-driver)
@@ -26,8 +23,9 @@
 #   Linux:
 #     - ~/.local/bin/cua-driver symlink (only when it resolves to a
 #       cua-driver path — a Swift-driver symlink is left in place)
-#     - ~/.cua-driver/ (current package home) + legacy ~/.cua-driver-rs/
-#       (telemetry id, config.json, versioned releases, current symlink)
+#     - versioned packages/current symlink under ~/.cua-driver/
+#     - telemetry id, preference, and registration markers are preserved by
+#       default so a reinstall remains the same pseudonymous installation
 #     - ~/.config/systemd/user/cua-driver-rs.service (if --autostart
 #       was used via install-local.sh — stop + disable + remove)
 #     - Skill symlinks under ~/.claude/skills/cua-driver(-rs), ~/.agents/
@@ -36,7 +34,8 @@
 #     - /Applications/CuaDriver.app bundle (+ legacy CuaDriverRs.app)
 #     - ~/.local/bin/cua-driver symlink (only when it resolves into
 #       /Applications/CuaDriver.app)
-#     - ~/.cua-driver/ (current package home) + legacy ~/.cua-driver-rs/
+#     - runtime payloads under ~/.cua-driver/ and legacy ~/.cua-driver-rs/;
+#       telemetry state remains unless --purge is passed
 #     - ~/Library/LaunchAgents/com.trycua.cua-driver-rs.plist (if
 #       --autostart was used via install-local.sh — unload + remove)
 #     - Skill symlinks under ~/.claude/skills/cua-driver(-rs), etc.
@@ -45,20 +44,22 @@
 # symlink use the same bundle id (com.trycua.driver) as the Swift driver,
 # so they're only removed when an unambiguous Rust marker is on disk
 # (~/.cua-driver/packages/, legacy ~/.cua-driver-rs/, CuaDriverRs.app,
-# or the LaunchAgent/systemd unit).
+# the LaunchAgent/systemd unit, or current Rust telemetry state).
 #
 # Also scrubs Claude MCP registrations in ~/.claude.json that match
 # the active backend.
 #
-# Does NOT revoke TCC grants on macOS (Accessibility + Screen Recording).
-# The closing message points at the tccutil commands for a clean
-# re-install flow.
+# Revokes TCC grants on macOS by default (Accessibility + Screen Recording)
+# so the next install prompts cleanly under the new signing identity. Pass
+# --keep-tcc to preserve grants across uninstall/reinstall.
 #
 # Usage:
-#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/uninstall.sh)"
+#   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)"
+#   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)" -- --purge
 #
 # Env overrides (mirror install side):
-#   CUA_DRIVER_RS_HOME    Rust package home to remove (default ~/.cua-driver-rs)
+#   CUA_DRIVER_HOME       Rust package home to remove (default ~/.cua-driver)
+#   CUA_DRIVER_RS_HOME    Legacy alias for CUA_DRIVER_HOME
 set -euo pipefail
 
 # ----------------------------------------------------------------------
@@ -67,7 +68,8 @@ set -euo pipefail
 # flag flows through without edits.
 # ----------------------------------------------------------------------
 USE_RUST_BACKEND=1
-RESET_TCC=0
+RESET_TCC=1
+PURGE_DATA=0
 FORWARDED_ARGS=()
 PASSTHROUGH=0
 while [[ $# -gt 0 ]]; do
@@ -77,10 +79,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --experimental-rust) shift ;;  # legacy alias for default Rust path
         --backend=rust)      shift ;;
-        --backend=swift)     USE_RUST_BACKEND=0; shift ;;
-        --reset-tcc)         RESET_TCC=1; shift ;;  # also revoke TCC grants (opt-in)
+        --backend=swift)     shift ;;  # retired Swift (no-op)
+        --reset-tcc)         RESET_TCC=1; shift ;;  # legacy/explicit default: revoke TCC grants
+        --keep-tcc)          RESET_TCC=0; shift ;;  # preserve TCC grants across reinstall
+        --purge)             PURGE_DATA=1; shift ;;  # also delete pseudonymous identity + preference
         --backend=*)
-            printf 'error: unknown backend %q; supported: swift, rust\n' "${1#*=}" >&2
+            printf 'error: unknown backend %q; supported: rust\n' "${1#*=}" >&2
             exit 2
             ;;
         --)                  PASSTHROUGH=1; shift ;;  # forward the rest verbatim
@@ -88,9 +92,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# The Swift binary is macOS-only, so `--backend=swift` on Linux is a
-# deliberate no-op (the script reaches the Swift branch below, finds
-# nothing, exits clean).
+# Legacy --backend=swift is accepted as a no-op for backward compat.
 OS="$(uname -s 2>/dev/null || echo unknown)"
 if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     if [[ "$OS" != "Darwin" ]]; then
@@ -105,25 +107,25 @@ fi
 # ----------------------------------------------------------------------
 log() { printf '==> %s\n' "$*"; }
 
-# Opt-in TCC revocation (`--reset-tcc`). Off by default: the bundle id
-# com.trycua.driver is shared with the retired Swift driver, and keeping
-# grants across a reinstall avoids a re-prompt — so wiping privacy state
-# is a deliberate, explicit choice, not a side effect of uninstall.
-# When the flag is set, revoke Accessibility + Screen-Recording +
-# Automation for com.trycua.driver. macOS-only; no-op elsewhere.
+# TCC revocation is on by default so uninstall leaves the next macOS install
+# in a clean promptable state. The bundle id com.trycua.driver is shared with
+# the retired Swift driver, so `--keep-tcc` remains available for users who
+# intentionally want grants to survive uninstall/reinstall.
+# When enabled, revoke Accessibility + Screen-Recording + Automation for
+# com.trycua.driver. macOS-only; no-op elsewhere.
 maybe_reset_tcc() {
     [[ "$RESET_TCC" == "1" ]] || return 0
     if [[ "$OS" != "Darwin" ]]; then
-        log "--reset-tcc is macOS-only; nothing to revoke on $OS"
+        log "TCC reset is macOS-only; nothing to revoke on $OS"
         return 0
     fi
     if ! command -v tccutil >/dev/null 2>&1; then
-        log "--reset-tcc: tccutil not found; skipping"
+        log "TCC reset: tccutil not found; skipping"
         return 0
     fi
-    log "revoking TCC grants for com.trycua.driver (--reset-tcc)"
+    log "revoking TCC grants for com.trycua.driver"
     log "  note: com.trycua.driver is shared with the retired Swift driver;"
-    log "  this clears grants for both. The next launch will re-prompt."
+    log "  this clears grants for both. Pass --keep-tcc to preserve them."
     for SVC in Accessibility ScreenCapture AppleEvents; do
         if tccutil reset "$SVC" com.trycua.driver >/dev/null 2>&1; then
             log "  reset $SVC"
@@ -198,8 +200,10 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     #   - ~/.cua-driver-rs/ exists (legacy Rust state dir, pre-rename)
     #   - /Applications/CuaDriverRs.app exists (legacy bundle, pre-rename)
     #   - LaunchAgent plist / systemd unit exists (autostart was used)
+    #   - current telemetry identity/registration marker exists (release
+    #     installs on macOS live in /Applications and have no packages dir)
     RUST_INSTALL_PRESENT=0
-    if [[ -d "$PACKAGES_DIR" || -d "$LEGACY_HOME_DIR" || -d "$LEGACY_APP_BUNDLE" || -f "$LAUNCHAGENT_PLIST" || -f "$SYSTEMD_USER_UNIT" ]]; then
+    if [[ -d "$PACKAGES_DIR" || -d "$LEGACY_HOME_DIR" || -d "$LEGACY_APP_BUNDLE" || -f "$LAUNCHAGENT_PLIST" || -f "$SYSTEMD_USER_UNIT" || -f "$HOME_DIR/.telemetry_id" || -f "$HOME_DIR/.installation_recorded" ]]; then
         RUST_INSTALL_PRESENT=1
     fi
 
@@ -305,25 +309,49 @@ if [[ "$USE_RUST_BACKEND" == "1" ]]; then
     fi
 
     # --- Package home ---
-    # Everything under $HOME_DIR (default ~/.cua-driver): telemetry id,
-    # config.json, versioned releases, current symlink, local skill copy,
-    # version_check.json cache. This is the live runtime home now (post
-    # v0.2.16 rename), so gate its removal on the Rust marker — don't nuke
-    # a Swift-only Mac's ~/.cua-driver/config.json on a mistaken run.
+    # A normal uninstall deliberately keeps the pseudonymous installation ID,
+    # persisted telemetry preference, and install/release markers. This lets a
+    # later reinstall be counted as a returning installation without sending
+    # any events while disabled. `--purge` is the explicit identity reset.
+    # All removal remains gated on the Rust marker so a mistaken invocation
+    # cannot damage a Swift-only Mac's shared ~/.cua-driver state.
     if [[ -d "$HOME_DIR" ]]; then
-        if [[ "$RUST_INSTALL_PRESENT" == "1" ]]; then
-            rm -rf "$HOME_DIR"
-            log "removed $HOME_DIR"
+        if [[ "$RUST_INSTALL_PRESENT" == "1" || "$PURGE_DATA" == "1" ]]; then
+            if [[ "$PURGE_DATA" == "1" ]]; then
+                rm -rf "$HOME_DIR"
+                log "purged $HOME_DIR (including telemetry identity and preference)"
+            else
+                # Remove only installer/runtime-owned payloads. Unknown files
+                # and all telemetry state remain untouched.
+                rm -rf "$HOME_DIR/packages" "$HOME_DIR/skills"
+                rm -f \
+                    "$HOME_DIR/.tcc-signing-identity" \
+                    "$HOME_DIR/serve.out.log" \
+                    "$HOME_DIR/serve.err.log"
+                log "removed runtime payloads from $HOME_DIR"
+                log "preserved telemetry identity, preference, and registration markers"
+            fi
         else
             log "$HOME_DIR exists but no Rust marker on disk; leaving it (looks like a Swift-only / shared config dir)"
         fi
     else
         log "no package home at $HOME_DIR (skipping)"
     fi
-    # Legacy pre-rename home is unambiguously Rust — always sweep it.
+    # Preserve legacy telemetry state during a normal uninstall so the
+    # runtime's existing one-shot migration can carry the same identity into
+    # ~/.cua-driver on reinstall.
     if [[ -d "$LEGACY_HOME_DIR" ]]; then
-        rm -rf "$LEGACY_HOME_DIR"
-        log "removed legacy package home $LEGACY_HOME_DIR"
+        if [[ "$PURGE_DATA" == "1" ]]; then
+            rm -rf "$LEGACY_HOME_DIR"
+            log "purged legacy package home $LEGACY_HOME_DIR"
+        else
+            rm -rf "$LEGACY_HOME_DIR/packages" "$LEGACY_HOME_DIR/skills"
+            rm -f \
+                "$LEGACY_HOME_DIR/.tcc-signing-identity" \
+                "$LEGACY_HOME_DIR/serve.out.log" \
+                "$LEGACY_HOME_DIR/serve.err.log"
+            log "removed legacy runtime payloads and preserved legacy telemetry state"
+        fi
     fi
 
     # --- Swift-era macOS data dirs (leave nothing behind) ---
@@ -515,12 +543,21 @@ PY
     if [[ "$OS" == "Darwin" ]]; then
         echo ""
         echo "cua-driver uninstalled."
+        if [[ "$PURGE_DATA" == "0" ]]; then
+            cat << 'TELEMETRYUNMSG'
+
+Telemetry identity and preference were preserved for a future reinstall.
+To delete them too, re-run with --purge:
+
+  /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)" -- --purge
+TELEMETRYUNMSG
+        fi
         if [[ "$RESET_TCC" != "1" ]]; then
             cat << 'FINALUNMSG'
 
 TCC grants (Accessibility + Screen Recording) remain in System
-Settings > Privacy & Security. Reset them explicitly — or re-run with
---reset-tcc — if you want a clean re-install flow:
+Settings > Privacy & Security because uninstall was run with --keep-tcc.
+Reset them explicitly if you want a clean re-install flow:
 
   tccutil reset Accessibility com.trycua.driver
   tccutil reset ScreenCapture com.trycua.driver
@@ -531,15 +568,16 @@ FINALUNMSG
 
 cua-driver uninstalled.
 FINALUNMSG
-    fi
-    exit 0
-fi
+        if [[ "$PURGE_DATA" == "0" ]]; then
+            cat << 'TELEMETRYUNMSG'
 
-# ----------------------------------------------------------------------
-# Swift uninstall branch (macOS legacy, explicit --backend=swift only).
-# ----------------------------------------------------------------------
-if [[ "$OS" != "Darwin" ]]; then
-    log "legacy Swift uninstall requested on non-macOS host ($OS); nothing to remove"
+Telemetry identity and preference were preserved for a future reinstall.
+To delete them too, re-run with --purge:
+
+  /bin/bash -c "$(curl -fsSL https://cua.ai/driver/uninstall.sh)" -- --purge
+TELEMETRYUNMSG
+        fi
+    fi
     exit 0
 fi
 
@@ -757,8 +795,8 @@ if [[ "$RESET_TCC" != "1" ]]; then
     cat << 'FINALUNMSG'
 
 TCC grants (Accessibility + Screen Recording) remain in System
-Settings > Privacy & Security. Reset them explicitly — or re-run with
---reset-tcc — if you want a clean re-install flow:
+Settings > Privacy & Security because uninstall was run with --keep-tcc.
+Reset them explicitly if you want a clean re-install flow:
 
   tccutil reset Accessibility com.trycua.driver
   tccutil reset ScreenCapture com.trycua.driver

@@ -5,7 +5,9 @@
 //!   from XComposite.  The window covers the full display area.
 //! - A background thread renders frames at ~60 Hz using tiny-skia and XShmPutImage
 //!   (or XPutImage fallback) with XRender ARGB compositing.
-//! - Mouse events pass through via `XShapeSelectInput(ShapeInput, empty-region)`.
+//! - XShape clips both input and visible pixels. The visible shape follows the
+//!   rendered alpha mask so bare X11 window managers do not show a black
+//!   full-screen ARGB window when no compositor is present.
 //! - Z-ordering: `XRaiseWindow` every 80ms to stay above normal windows.
 //! - Wayland: when WAYLAND_DISPLAY is set but DISPLAY is also available (XWayland),
 //!   the X11 path is used.  Pure Wayland support is a TODO.
@@ -19,14 +21,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use cursor_overlay::ZOrderEnforcer;
 use cursor_overlay::{
     CursorConfig, CursorKey, KeyedOverlayCommand, OverlayCommand, OverlayMsg, Palette,
     RenderStateCore,
 };
-#[cfg(target_os = "linux")]
-use cursor_overlay::ZOrderEnforcer;
 
 // ── Global channel ────────────────────────────────────────────────────────
 
@@ -127,15 +130,36 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     if key.is_empty() {
         return;
     }
-    let msg = OverlayMsg::Cmd(KeyedOverlayCommand { key: key.clone(), cmd: cmd.clone() });
+    let msg = OverlayMsg::Cmd(KeyedOverlayCommand {
+        key: key.clone(),
+        cmd: cmd.clone(),
+    });
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(msg.clone());
     }
     // Also forward to the native-Wayland layer-shell overlay when Wayland
     // is opted in. The wayland overlay's `forward` is a no-op when its
     // owner thread isn't started yet (which is the normal X11-only case).
-    if crate::wayland::is_wayland() {
-        let _ = crate::wayland::overlay::forward(&msg);
+    #[cfg(target_os = "linux")]
+    {
+        if crate::wayland::is_wayland() {
+            if crate::wayland::shell_helper::available() {
+                // GNOME has no layer-shell. Drive only the final positioning
+                // commands through the compositor helper; it performs its own
+                // easing and avoids starting a worker that must fail.
+                match &cmd {
+                    cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
+                        crate::wayland::shell_helper::click_pulse(*x as i32, *y as i32);
+                    }
+                    cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
+                        crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
+                    }
+                    _ => {}
+                }
+            } else {
+                let _ = crate::wayland::overlay::forward(&msg);
+            }
+        }
     }
 }
 
@@ -144,7 +168,9 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn is_enabled_for(key: &str) -> bool {
-    RENDER.lock().ok()
+    RENDER
+        .lock()
+        .ok()
         .and_then(|g| {
             g.as_ref().and_then(|m| {
                 m.cursors
@@ -161,15 +187,38 @@ pub fn current_position() -> (f64, f64) {
 }
 
 pub fn current_position_for(key: &str) -> (f64, f64) {
-    RENDER.lock().ok()
-        .and_then(|g| g.as_ref().and_then(|m| m.cursors.get(key)).map(|rs| rs.core.pos))
+    RENDER
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.cursors.get(key))
+                .map(|rs| rs.core.pos)
+        })
         .unwrap_or((-200.0, -200.0))
+}
+
+pub fn current_motion_for(key: &str) -> cursor_overlay::MotionConfig {
+    RENDER
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard.as_ref().and_then(|map| {
+                map.cursors
+                    .get(key)
+                    .or_else(|| map.cursors.get("default"))
+                    .map(|state| state.core.motion.clone())
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
     const SEED_OFFSET: f64 = 140.0;
     let mut guard = RENDER.lock().unwrap();
-    let Some(map) = guard.as_mut() else { return false };
+    let Some(map) = guard.as_mut() else {
+        return false;
+    };
     if map.ended.contains(key) {
         return false;
     }
@@ -217,11 +266,14 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     arrival_register(key.clone(), tx);
 
-    send_command_for(key, OverlayCommand::MoveTo {
-        x,
-        y,
-        end_heading_radians: std::f64::consts::FRAC_PI_4,
-    });
+    send_command_for(
+        key,
+        OverlayCommand::MoveTo {
+            x,
+            y,
+            end_heading_radians: std::f64::consts::FRAC_PI_4,
+        },
+    );
 
     let _ = rx.await;
 }
@@ -311,10 +363,10 @@ impl RenderState {
 fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
     use x11rb::connection::Connection;
     use x11rb::protocol::shape::{ConnectionExt as ShapeConnectionExt, SK, SO};
+    use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
     use x11rb::protocol::xproto::{
         AtomEnum, ColormapAlloc, CreateWindowAux, EventMask, PropMode, WindowClass,
     };
-    use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
     use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
     // Connect to X11.
@@ -327,9 +379,9 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     };
 
     let screen = &conn.setup().roots[screen_num];
-    let root   = screen.root;
-    let scr_w  = screen.width_in_pixels as u32;
-    let scr_h  = screen.height_in_pixels as u32;
+    let root = screen.root;
+    let scr_w = screen.width_in_pixels as u32;
+    let scr_h = screen.height_in_pixels as u32;
 
     // Update render state with screen size.
     {
@@ -342,13 +394,17 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
 
     // Find 32-bit ARGB visual for compositing.
     // Falls back to the default visual if XComposite 32-bit isn't available.
-    let (visual_id, depth, colormap) = find_argb_visual(&conn, screen)
-        .unwrap_or((screen.root_visual, screen.root_depth, screen.default_colormap));
+    let (visual_id, depth, colormap) = find_argb_visual(&conn, screen).unwrap_or((
+        screen.root_visual,
+        screen.root_depth,
+        screen.default_colormap,
+    ));
 
     // Create a matching colormap if we got a non-default visual.
     let colormap = if visual_id != screen.root_visual {
         let cm = conn.generate_id().unwrap();
-        conn.create_colormap(ColormapAlloc::NONE, cm, root, visual_id).ok();
+        conn.create_colormap(ColormapAlloc::NONE, cm, root, visual_id)
+            .ok();
         cm
     } else {
         colormap
@@ -366,24 +422,32 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         .event_mask(EventMask::NO_EVENT);
 
     conn.create_window(
-        depth, win, root,
-        0, 0, scr_w as u16, scr_h as u16,
+        depth,
+        win,
+        root,
+        0,
+        0,
+        scr_w as u16,
+        scr_h as u16,
         0,
         WindowClass::INPUT_OUTPUT,
         visual_id,
         &win_aux,
-    ).ok();
+    )
+    .ok();
 
     // Set window title (identifies our overlay, matches Windows convention).
     // `Cua.` namespace mirrors the Windows class-name + install-path
     // convention; was `TropeCUA.` (leaked codename from an early C# ref).
     let title = format!("Cua.AgentCursorOverlay.{}", cfg.cursor_id);
     conn.change_property8(
-        PropMode::REPLACE, win,
+        PropMode::REPLACE,
+        win,
         AtomEnum::WM_NAME,
         AtomEnum::STRING,
         title.as_bytes(),
-    ).ok();
+    )
+    .ok();
 
     // Make the window fully click-through using the Shape extension (empty input region).
     // This is the X11 equivalent of WS_EX_TRANSPARENT on Windows. Note that
@@ -394,9 +458,11 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         SK::INPUT,
         x11rb::protocol::xproto::ClipOrdering::UNSORTED,
         win,
-        0, 0,
+        0,
+        0,
         &[],
-    ).ok();
+    )
+    .ok();
 
     conn.map_window(win).ok();
     conn.flush().ok();
@@ -409,7 +475,7 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
 
     loop {
         let now = Instant::now();
-        let dt  = now.duration_since(last_tick).as_secs_f64().min(0.05);
+        let dt = now.duration_since(last_tick).as_secs_f64().min(0.05);
         last_tick = now;
 
         // Drain commands and tick.
@@ -499,7 +565,9 @@ struct X11ZOrderEnforcer<'a, C: x11rb::connection::Connection> {
 #[cfg(target_os = "linux")]
 impl<'a, C: x11rb::connection::Connection> ZOrderEnforcer for X11ZOrderEnforcer<'a, C> {
     fn reassert(&self, target: Option<u64>) {
-        use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, StackMode};
+        use x11rb::protocol::xproto::{
+            ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, StackMode,
+        };
 
         // Per the ZOrderEnforcer trait contract, a stale `target` (window
         // gone) should fall back to the `None` behavior — top of the
@@ -535,13 +603,15 @@ impl<'a, C: x11rb::connection::Connection> ZOrderEnforcer for X11ZOrderEnforcer<
 
 #[cfg(target_os = "linux")]
 fn find_argb_visual(
-    conn: &impl x11rb::connection::Connection,
+    _conn: &impl x11rb::connection::Connection,
     screen: &x11rb::protocol::xproto::Screen,
 ) -> Option<(u32, u8, u32)> {
     use x11rb::protocol::xproto::VisualClass;
     // Walk all depth entries looking for a 32-bit ARGB visual.
     for depth_entry in &screen.allowed_depths {
-        if depth_entry.depth != 32 { continue; }
+        if depth_entry.depth != 32 {
+            continue;
+        }
         for visual in &depth_entry.visuals {
             if visual.class == VisualClass::TRUE_COLOR {
                 return Some((visual.visual_id, 32, screen.default_colormap));
@@ -557,13 +627,17 @@ fn find_argb_visual(
 fn paint_x11(
     conn: &impl x11rb::connection::Connection,
     win: u32,
-    w: u32, h: u32,
+    w: u32,
+    h: u32,
     depth: u8,
     _visual_id: u32,
     pm: &tiny_skia::Pixmap,
 ) {
+    use x11rb::protocol::shape::{ConnectionExt as ShapeConnectionExt, SK, SO};
     use x11rb::protocol::xproto::{ConnectionExt as XprotoConnectionExt, CreateGCAux, ImageFormat};
-    if pm.width() == 0 || pm.height() == 0 { return; }
+    if pm.width() == 0 || pm.height() == 0 {
+        return;
+    }
 
     // Create a GC for the window if we don't have one.
     // (Simplified: we recreate it every frame which is safe but not optimal.)
@@ -572,25 +646,35 @@ fn paint_x11(
         Err(_) => return,
     };
     let gc_aux = CreateGCAux::new();
-    if conn.create_gc(gc_id, win, &gc_aux).is_err() { return; }
-
-    // Convert RGBA premult → BGRA premult for X11.
-    let src = pm.data();
-    let mut bgra: Vec<u8> = Vec::with_capacity(src.len());
-    for chunk in src.chunks_exact(4) {
-        bgra.push(chunk[2]); // B
-        bgra.push(chunk[1]); // G
-        bgra.push(chunk[0]); // R
-        bgra.push(chunk[3]); // A
+    if conn.create_gc(gc_id, win, &gc_aux).is_err() {
+        return;
     }
+
+    let (bgra, visible_shape) = bgra_and_visible_shape(pm);
+
+    // A 32-bit ARGB window needs a compositor to blend transparent pixels.
+    // Without one, zero-alpha pixels display as opaque black. Clip the native
+    // window to the rendered non-zero alpha runs so the overlay remains usable
+    // under bare Openbox/i3/Xvfb sessions as well as composited desktops.
+    let _ = conn.shape_rectangles(
+        SO::SET,
+        SK::BOUNDING,
+        x11rb::protocol::xproto::ClipOrdering::UNSORTED,
+        win,
+        0,
+        0,
+        &visible_shape,
+    );
 
     // XPutImage (ZPixmap).
     let _ = conn.put_image(
         ImageFormat::Z_PIXMAP,
         win,
         gc_id,
-        w as u16, h as u16,
-        0, 0,
+        w as u16,
+        h as u16,
+        0,
+        0,
         0,
         depth,
         &bgra,
@@ -598,6 +682,80 @@ fn paint_x11(
 
     conn.free_gc(gc_id).ok();
     conn.flush().ok();
+}
+
+#[cfg(target_os = "linux")]
+fn bgra_and_visible_shape(
+    pm: &tiny_skia::Pixmap,
+) -> (Vec<u8>, Vec<x11rb::protocol::xproto::Rectangle>) {
+    use x11rb::protocol::xproto::Rectangle;
+
+    let width = pm.width() as usize;
+    let height = pm.height() as usize;
+    let src = pm.data();
+    let mut bgra = Vec::with_capacity(src.len());
+    let mut rectangles = Vec::new();
+
+    for y in 0..height {
+        let mut run_start = None;
+        for x in 0..width {
+            let offset = (y * width + x) * 4;
+            let pixel = &src[offset..offset + 4];
+            bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+
+            if pixel[3] != 0 {
+                run_start.get_or_insert(x);
+            } else if let Some(start) = run_start.take() {
+                rectangles.push(Rectangle {
+                    x: start as i16,
+                    y: y as i16,
+                    width: (x - start) as u16,
+                    height: 1,
+                });
+            }
+        }
+        if let Some(start) = run_start {
+            rectangles.push(Rectangle {
+                x: start as i16,
+                y: y as i16,
+                width: (width - start) as u16,
+                height: 1,
+            });
+        }
+    }
+
+    (bgra, rectangles)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::bgra_and_visible_shape;
+
+    #[test]
+    fn visible_shape_contains_only_nontransparent_runs() {
+        let mut pixmap = tiny_skia::Pixmap::new(4, 2).unwrap();
+        pixmap.data_mut().copy_from_slice(&[
+            1, 2, 3, 0, 10, 20, 30, 255, 11, 21, 31, 128, 4, 5, 6, 0, 7, 8, 9, 64, 1, 1, 1, 0, 2,
+            2, 2, 0, 12, 22, 32, 255,
+        ]);
+
+        let (bgra, rectangles) = bgra_and_visible_shape(&pixmap);
+
+        assert_eq!(&bgra[4..8], &[30, 20, 10, 255]);
+        assert_eq!(rectangles.len(), 3);
+        assert_eq!(
+            (rectangles[0].x, rectangles[0].y, rectangles[0].width),
+            (1, 0, 2)
+        );
+        assert_eq!(
+            (rectangles[1].x, rectangles[1].y, rectangles[1].width),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            (rectangles[2].x, rectangles[2].y, rectangles[2].width),
+            (3, 1, 1)
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -25,11 +25,18 @@
 
 use std::sync::Arc;
 
+use cua_driver_core::policy::{configured_policy, PolicyDecision};
 use cua_driver_core::protocol::{initialize_result, Request, Response};
+use cua_driver_core::server::{
+    observe_proxy_session_started, observe_proxy_tool_completed, tool_observation_timer,
+    StdioExecutionPath,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
-use crate::serve::{is_daemon_listening, send_request, DaemonRequest};
+use crate::serve::{
+    is_daemon_listening, send_request, DaemonRequest, ToolObservationOrigin,
+};
 
 /// Run the MCP stdio proxy. Reads JSON-RPC lines from stdin, forwards
 /// the body of each `tools/list` / `tools/call` to the daemon at
@@ -45,6 +52,7 @@ use crate::serve::{is_daemon_listening, send_request, DaemonRequest};
 /// advertises zero tools and then errors on every call. Matches
 /// Swift `makeProxy`'s `fetchProxyToolList` pre-check.
 pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
+    configured_policy().map_err(anyhow::Error::msg)?;
     if !is_daemon_listening(&socket_path) {
         anyhow::bail!(
             "cua-driver-rs daemon not reachable on {socket_path}. Start it \
@@ -76,24 +84,28 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     // alive-but-idle session — one issuing zero tool calls — is never reaped:
     // its control connection stays parked open.
     //
-    // Detached + fire-and-forget. If the connect races daemon startup and
-    // fails, we log and continue — the per-call `send_request` has its own
-    // retry/timeout, and a restarted daemon loses session state anyway, so a
-    // missing control connection only degrades to no-reaper (the recording
-    // idle-TTL still backstops a leaked recording). It must NOT bail the proxy.
+    // The daemon must acknowledge `session_begin` before the proxy accepts tool
+    // calls. Besides lifecycle cleanup, that registered control channel is the
+    // trust boundary used by destructive `browser_prepare` calls.
+    let (control_ready_tx, control_ready_rx) = tokio::sync::oneshot::channel();
     {
         let socket = socket_path.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
-            run_control_connection(socket, sid).await;
+            run_control_connection(socket, sid, control_ready_tx).await;
         });
     }
+    tokio::time::timeout(std::time::Duration::from_secs(4), control_ready_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon did not acknowledge the MCP control session"))?
+        .map_err(|_| anyhow::anyhow!("daemon control session closed before acknowledgement"))?;
 
     // Cache the tool list once at startup. The daemon's registry is
     // static for the lifetime of the daemon, so polling on every
     // `tools/list` would waste a round-trip per call. Swift does the
     // same caching in `fetchProxyToolList`.
-    let cached_tools_list = fetch_tools_list_from_daemon(&socket_path, &session_id)?;
+    let (cached_tools_list, daemon_observes_tool_calls) =
+        fetch_tools_list_from_daemon(&socket_path, &session_id)?;
     let cached_tools_list = Arc::new(cached_tools_list);
 
     let stdin = tokio::io::stdin();
@@ -101,6 +113,7 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stdin);
     let mut writer = tokio::io::BufWriter::new(stdout);
     let mut line = String::new();
+    let mut session_observed = false;
 
     loop {
         line.clear();
@@ -124,8 +137,53 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
                 continue;
             }
             Ok(req) => {
+                let initialize_metadata = (!session_observed)
+                    .then(|| req.initialize_metadata())
+                    .flatten();
+                let session_context = (!daemon_observes_tool_calls)
+                    .then(|| {
+                        req.tool_call().ok().and_then(|call| {
+                            let known_tool = proxy_knows_tool(&cached_tools_list, &call.name);
+                            cua_driver_core::session::begin_tool_call(
+                                &call.name,
+                                &call.args,
+                                known_tool,
+                                cua_driver_core::session::SessionTransport::McpStdio,
+                            )
+                        })
+                    })
+                    .flatten();
+                let tool_timer = (!daemon_observes_tool_calls)
+                    .then(|| {
+                        tool_observation_timer(
+                            &req,
+                            |name| proxy_knows_tool(&cached_tools_list, name),
+                            StdioExecutionPath::DaemonProxy,
+                        )
+                    })
+                    .flatten();
                 let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-                handle_proxy_request(req, id, &socket_path, &cached_tools_list, &session_id).await
+                let response = handle_proxy_request(
+                    req,
+                    id,
+                    &socket_path,
+                    &cached_tools_list,
+                    &session_id,
+                    daemon_observes_tool_calls,
+                )
+                .await;
+                if let Some(metadata) = initialize_metadata {
+                    observe_proxy_session_started(metadata);
+                    session_observed = true;
+                }
+                if let Some(timer) = tool_timer {
+                    let outcome = timer.finish(&response);
+                    if let Some(context) = session_context {
+                        context.complete(&outcome);
+                    }
+                    observe_proxy_tool_completed(outcome);
+                }
+                response
             }
         };
 
@@ -152,6 +210,20 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {
+    if name == "type_text_chars" {
+        return true;
+    }
+    cached_tools_list
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        })
+}
+
 /// Own the proxy's single long-lived control connection. Connects directly to
 /// the daemon socket (its OWN async open — `send_request` is sync, blocking,
 /// and one-shot, so it cannot be reused here), sends one `session_begin` line
@@ -164,12 +236,17 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
 /// and the task ends; the proxy keeps running on its per-call connections. A
 /// connect failure (racing daemon startup) is logged and swallowed — it must
 /// not bail the proxy.
-async fn run_control_connection(socket_path: String, session_id: String) {
+async fn run_control_connection(
+    socket_path: String,
+    session_id: String,
+    control_ready: tokio::sync::oneshot::Sender<()>,
+) {
     let begin = DaemonRequest {
         method: "session_begin".into(),
         name: None,
         args: None,
         session_id: Some(session_id.clone()),
+        observation_origin: None,
     };
     let line = match serde_json::to_string(&begin) {
         Ok(s) => s + "\n",
@@ -211,6 +288,12 @@ async fn run_control_connection(socket_path: String, session_id: String) {
         // death, when the kernel closes it and the daemon reaps the session.
         let mut reader = BufReader::new(stream);
         let mut buf = String::new();
+        match reader.read_line(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let _ = control_ready.send(());
+            }
+        }
         loop {
             buf.clear();
             match reader.read_line(&mut buf).await {
@@ -252,6 +335,12 @@ async fn run_control_connection(socket_path: String, session_id: String) {
 
         let mut reader = BufReader::new(client);
         let mut buf = String::new();
+        match reader.read_line(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let _ = control_ready.send(());
+            }
+        }
         loop {
             buf.clear();
             match reader.read_line(&mut buf).await {
@@ -264,7 +353,7 @@ async fn run_control_connection(socket_path: String, session_id: String) {
 
     #[cfg(all(not(unix), not(target_os = "windows")))]
     {
-        let _ = (line, session_id, socket_path);
+        let _ = (line, session_id, socket_path, control_ready);
     }
 }
 
@@ -289,12 +378,13 @@ fn mint_session_id() -> String {
 fn fetch_tools_list_from_daemon(
     socket_path: &str,
     session_id: &str,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<(serde_json::Value, bool)> {
     let req = DaemonRequest {
         method: "list".into(),
         name: None,
         args: None,
         session_id: Some(session_id.to_owned()),
+        observation_origin: None,
     };
     let resp = send_request(socket_path, &req)?;
     if !resp.ok {
@@ -303,15 +393,13 @@ fn fetch_tools_list_from_daemon(
             resp.error.unwrap_or_else(|| "(no error message)".into())
         );
     }
-    let result = resp.result.ok_or_else(|| {
-        anyhow::anyhow!("daemon list response missing `result` field")
-    })?;
+    let result = resp
+        .result
+        .ok_or_else(|| anyhow::anyhow!("daemon list response missing `result` field"))?;
     let tools_array = result
         .get("tools")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            anyhow::anyhow!("daemon list response missing `tools` array")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("daemon list response missing `tools` array"))?;
 
     // Reshape the daemon's `{name, description, input_schema, read_only,
     // ..., capabilities}` envelope into MCP's `{name, description,
@@ -331,17 +419,28 @@ fn fetch_tools_list_from_daemon(
                 .get("description")
                 .cloned()
                 .unwrap_or(serde_json::Value::String(String::new()));
-            let input_schema = t.get("input_schema").cloned().unwrap_or_else(
-                || serde_json::json!({"type": "object", "properties": {}}),
-            );
-            let read_only = t.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
-            let destructive =
-                t.get("destructive").and_then(|v| v.as_bool()).unwrap_or(false);
-            let idempotent =
-                t.get("idempotent").and_then(|v| v.as_bool()).unwrap_or(false);
-            let open_world =
-                t.get("open_world").and_then(|v| v.as_bool()).unwrap_or(false);
-            let capabilities = t.get("capabilities")
+            let input_schema = t
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+            let read_only = t
+                .get("read_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let destructive = t
+                .get("destructive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let idempotent = t
+                .get("idempotent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let open_world = t
+                .get("open_world")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let capabilities = t
+                .get("capabilities")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_else(|| {
@@ -377,19 +476,31 @@ fn fetch_tools_list_from_daemon(
     let capability_version = result
         .get("capability_version")
         .cloned()
-        .unwrap_or_else(|| serde_json::Value::String(
-            cua_driver_core::tool::CAPABILITY_VERSION.to_owned()
-        ));
+        .unwrap_or_else(|| {
+            serde_json::Value::String(cua_driver_core::tool::CAPABILITY_VERSION.to_owned())
+        });
     let schema_version = result
         .get("schema_version")
         .cloned()
         .unwrap_or_else(|| serde_json::Value::String("1".to_owned()));
 
-    Ok(serde_json::json!({
-        "tools": mcp_tools,
-        "capability_version": capability_version,
-        "schema_version": schema_version,
-    }))
+    let daemon_observes_tool_calls = daemon_owns_tool_observation(&result);
+
+    Ok((
+        serde_json::json!({
+            "tools": mcp_tools,
+            "capability_version": capability_version,
+            "schema_version": schema_version,
+        }),
+        daemon_observes_tool_calls,
+    ))
+}
+
+fn daemon_owns_tool_observation(result: &serde_json::Value) -> bool {
+    result
+        .get("tool_observation_owner")
+        .and_then(serde_json::Value::as_str)
+        == Some("daemon")
 }
 
 /// JSON-RPC method dispatcher for the proxy. Mirrors
@@ -407,6 +518,7 @@ async fn handle_proxy_request(
     socket_path: &str,
     cached_tools_list: &Arc<serde_json::Value>,
     session_id: &str,
+    daemon_observes_tool_calls: bool,
 ) -> Response {
     match req.method.as_str() {
         "initialize" => Response::ok(id, initialize_result()),
@@ -415,7 +527,44 @@ async fn handle_proxy_request(
 
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
-            Ok(call) => forward_tool_call(id, call.name, call.args, socket_path, session_id).await,
+            Ok(call) => {
+                match configured_policy() {
+                    Ok(Some(policy)) => match policy.evaluate(&call.name, &call.args) {
+                        PolicyDecision::Allow => {}
+                        PolicyDecision::Deny(reason) => {
+                            return Response::error(
+                                id,
+                                -32603,
+                                format!("Permission denied: {reason}"),
+                            );
+                        }
+                        PolicyDecision::Error(message) => {
+                            return Response::error(
+                                id,
+                                -32603,
+                                format!("Policy evaluation error: {message}"),
+                            );
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(message) => {
+                        return Response::error(
+                            id,
+                            -32603,
+                            format!("Policy loading error: {message}"),
+                        );
+                    }
+                }
+                forward_tool_call(
+                    id,
+                    call.name,
+                    call.args,
+                    socket_path,
+                    session_id,
+                    daemon_observes_tool_calls,
+                )
+                .await
+            }
         },
 
         other => {
@@ -441,15 +590,19 @@ async fn handle_proxy_request(
 async fn forward_tool_call(
     id: serde_json::Value,
     name: String,
-    args: serde_json::Value,
+    mut args: serde_json::Value,
     socket_path: &str,
     session_id: &str,
+    daemon_observes_tool_calls: bool,
 ) -> Response {
+    cua_driver_core::tool_args::sanitize_reserved_args(&mut args);
     let req = DaemonRequest {
         method: "call".into(),
         name: Some(name.clone()),
         args: Some(args),
         session_id: Some(session_id.to_owned()),
+        observation_origin: daemon_observes_tool_calls
+            .then_some(ToolObservationOrigin::McpProxy),
     };
 
     // The daemon client is sync, so jump to a blocking thread to keep
@@ -494,7 +647,9 @@ async fn forward_tool_call(
         // it as `Response::ok` with `isError: true`. Mirror that
         // shape here so MCP clients see identical envelopes either
         // way — CodeRabbit #2.
-        let msg = resp.error.unwrap_or_else(|| "daemon reported failure".into());
+        let msg = resp
+            .error
+            .unwrap_or_else(|| "daemon reported failure".into());
         let exit_code = resp.exit_code.unwrap_or(1);
         let result = serde_json::json!({
             "content": [{ "type": "text", "text": msg }],
@@ -517,8 +672,8 @@ async fn forward_tool_call(
 //
 // Unit-test only the JSON shape of the proxy's tool-error envelope.
 // The full proxy loop is exercised by the macOS integration test
-// (CUA_DRIVER_RS_MCP_FORCE_PROXY harness in PARITY.md §"Manual smoke
-// test"); these tests just lock in the per-branch reshape so a
+// (the CUA_DRIVER_RS_MCP_FORCE_PROXY harness); these tests just lock
+// in the per-branch reshape so a
 // regression to `Response::error` for tool-level failures would fail
 // fast in CI on every platform.
 
@@ -530,11 +685,10 @@ mod tests {
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert
     /// on the serialized shape without spinning up a real daemon /
     /// tokio runtime. Keep this in sync with `forward_tool_call`.
-    fn build_tool_error_response(
-        id: serde_json::Value,
-        resp: DaemonResponse,
-    ) -> Response {
-        let msg = resp.error.unwrap_or_else(|| "daemon reported failure".into());
+    fn build_tool_error_response(id: serde_json::Value, resp: DaemonResponse) -> Response {
+        let msg = resp
+            .error
+            .unwrap_or_else(|| "daemon reported failure".into());
         let exit_code = resp.exit_code.unwrap_or(1);
         let result = serde_json::json!({
             "content": [{ "type": "text", "text": msg }],
@@ -558,10 +712,14 @@ mod tests {
         // Top-level JSON-RPC envelope: success (`result`), not error.
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["id"], serde_json::json!(7));
-        assert!(value.get("error").is_none(),
-            "tool-level failure must NOT surface as JSON-RPC error: got {value}");
-        assert!(value.get("result").is_some(),
-            "tool-level failure must carry a `result` payload: got {value}");
+        assert!(
+            value.get("error").is_none(),
+            "tool-level failure must NOT surface as JSON-RPC error: got {value}"
+        );
+        assert!(
+            value.get("result").is_some(),
+            "tool-level failure must carry a `result` payload: got {value}"
+        );
 
         // CallTool.Result inside `result`: isError + content text.
         let result = &value["result"];
@@ -582,7 +740,38 @@ mod tests {
         let resp = build_tool_error_response(serde_json::json!("abc"), daemon_resp);
         let value = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(value["result"]["isError"], serde_json::json!(true));
-        assert_eq!(value["result"]["content"][0]["text"], "daemon reported failure");
+        assert_eq!(
+            value["result"]["content"][0]["text"],
+            "daemon reported failure"
+        );
         assert_eq!(value["result"]["structuredContent"]["exit_code"], 1);
+    }
+
+    #[test]
+    fn cached_proxy_tool_allowlist_is_exact() {
+        let cached = serde_json::json!({
+            "tools": [
+                {"name":"click"},
+                {"name":"type_text"}
+            ]
+        });
+        assert!(proxy_knows_tool(&cached, "click"));
+        assert!(
+            proxy_knows_tool(&cached, "type_text_chars"),
+            "deprecated alias stays bounded/known"
+        );
+        assert!(!proxy_knows_tool(&cached, "click/private-user-value"));
+        assert!(!proxy_knows_tool(&cached, ""));
+    }
+
+    #[test]
+    fn observation_ownership_requires_the_daemon_capability() {
+        assert!(daemon_owns_tool_observation(&serde_json::json!({
+            "tool_observation_owner": "daemon"
+        })));
+        assert!(!daemon_owns_tool_observation(&serde_json::json!({})));
+        assert!(!daemon_owns_tool_observation(&serde_json::json!({
+            "tool_observation_owner": "proxy"
+        })));
     }
 }
