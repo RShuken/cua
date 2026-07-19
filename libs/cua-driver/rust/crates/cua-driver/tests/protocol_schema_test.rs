@@ -3,11 +3,11 @@
 //! These never invoke a tool — they only inspect the advertised inputSchemas:
 //! that `type_text_chars` is hidden, the `list_windows.on_screen_only` knob, the
 //! `set_agent_cursor_motion` Bezier knobs, delivery and scope enums, and the
-//! `set_config.capture_mode` enum.
+//! `set_config.capture_mode` enum and the per-session capture-scope contract.
 
 #![cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 
-use cua_driver_testkit::RawDriver;
+use cua_driver_testkit::{Driver, McpDriver, RawDriver};
 
 #[test]
 fn tools_list_schema_shape() {
@@ -120,22 +120,41 @@ fn tools_list_schema_shape() {
             "{tool}.delivery_mode should advertise background and foreground: {delivery:?}"
         );
     }
-    // macOS selects desktop coordinates per click. Linux and Windows retain
-    // the process-level capture_scope gate used by their desktop-state tools.
-    #[cfg(target_os = "macos")]
-    {
-        let scope = &properties("click")["scope"];
+    // Capture scope belongs to the session lifecycle on every platform. The
+    // action-level `scope` selects a coordinate/transport form but cannot
+    // override the session policy enforced by the registry.
+    let capture_scope = &properties("start_session")["capture_scope"];
+    for expected in ["auto", "window", "desktop"] {
         assert!(
-            enum_contains(scope, "window") && enum_contains(scope, "desktop"),
-            "click.scope should advertise window and desktop: {scope:?}"
+            enum_contains(capture_scope, expected),
+            "start_session.capture_scope should advertise {expected}: {capture_scope:?}"
         );
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    {
-        let capture_scope = &properties("set_config")["capture_scope"];
+    assert!(
+        tools.iter().any(|tool| tool["name"] == "escalate_session"),
+        "escalate_session missing from tools/list"
+    );
+    assert!(
+        tools.iter().any(|tool| tool["name"] == "get_session_state"),
+        "get_session_state missing from tools/list"
+    );
+    assert!(
+        properties("set_config")["capture_scope"].is_null(),
+        "persistent set_config.capture_scope must remain retired"
+    );
+    for action in [
+        "click",
+        "type_text",
+        "press_key",
+        "hotkey",
+        "scroll",
+        "drag",
+        "move_cursor",
+    ] {
+        let scope = &properties(action)["scope"];
         assert!(
-            enum_contains(capture_scope, "window") && enum_contains(capture_scope, "desktop"),
-            "set_config.capture_scope should advertise window and desktop: {capture_scope:?}"
+            enum_contains(scope, "window") && enum_contains(scope, "desktop"),
+            "{action}.scope should advertise window and desktop: {scope:?}"
         );
     }
 
@@ -196,6 +215,47 @@ fn tools_list_schema_shape() {
             sc["inputSchema"]["properties"]
         );
     }
+}
+
+#[test]
+fn legacy_page_mutation_flag_is_read_by_the_spawned_daemon() {
+    let args = serde_json::json!({
+        "action": "enable_javascript_apple_events",
+        "user_has_confirmed_enabling": false
+    });
+
+    {
+        let mut driver = McpDriver::spawn().expect("spawn default source-built driver");
+        let response = driver.call("page", args.clone());
+        assert!(response.is_error(), "mutation must refuse by default");
+        assert!(
+            response
+                .text()
+                .contains("CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1"),
+            "default refusal must name the operator gate: {}",
+            response.text()
+        );
+    }
+
+    let mut driver = McpDriver::spawn_with_env(&[("CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS", "1")])
+        .expect("spawn source-built driver with daemon-scoped compatibility flag");
+    let response = driver.call("page", args);
+    assert!(
+        response.is_error(),
+        "unconfirmed mutation must still refuse"
+    );
+    assert!(
+        response
+            .text()
+            .contains("Set user_has_confirmed_enabling=true"),
+        "enabled daemon should reach the explicit confirmation gate: {}",
+        response.text()
+    );
+    assert!(
+        !response.text().contains("disabled by default"),
+        "the daemon did not observe its startup environment: {}",
+        response.text()
+    );
 }
 
 #[test]
