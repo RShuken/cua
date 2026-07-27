@@ -14,19 +14,19 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+#[cfg(target_os = "macos")]
+use cua_driver_testkit::ax::element_index_containing;
 use cua_driver_testkit::e2e::{
-    execute_case, recording_evidence, write_environment_from_env, CaseSpec, Delivery, DriverRoute,
-    EnvironmentRecord, Evidence, Observation, OracleKind, RefusalCode, Scope, Targeting,
+    append_json_line, execute_case, recording_evidence, write_environment_from_env, CaseSpec,
+    Delivery, DriverRoute, EnvironmentRecord, Evidence, Observation, OracleKind, RefusalCode,
+    Scope, Targeting,
 };
 use cua_driver_testkit::observer::TargetWindow;
 use cua_driver_testkit::sentinel::ForegroundSentinel;
 use cua_driver_testkit::{spawn_in_job, BrowserFixtureServer, Driver, McpDriver, ToolResponse};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
-
-use cua_driver_core::browser::approval::{
-    mint_existing_profile_approval, ExistingProfileApprovalScope,
-};
 
 const FIXTURE_HTML: &str = include_str!("../../../../tests/fixtures/shared/web/index.html");
 static STANDALONE_BROWSER_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -42,6 +42,18 @@ fn standalone_fixture_html() -> String {
   }
 </script>
 </body>"#,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn standalone_generic_type_text_html() -> String {
+    standalone_fixture_html().replace(
+        r#"<main class="harness-grid">"#,
+        r#"<div id="generic-long-editor" data-cua-id="generic-long-editor"
+     aria-label="generic-long-editor" contenteditable="true"
+     autocapitalize="off" autocorrect="off" spellcheck="false"
+     style="min-height:2em;border:1px solid #888;padding:4px"></div>
+<main class="harness-grid">"#,
     )
 }
 
@@ -166,6 +178,115 @@ struct BrowserSpec {
     executable: PathBuf,
 }
 
+const SUPPORTED_BROWSER_PRODUCTS: &[&str] = &["chrome", "chromium", "edge"];
+
+fn parse_browser_products(raw: &str) -> Result<Vec<String>, String> {
+    let mut products = Vec::new();
+    for product in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|product| !product.is_empty())
+    {
+        let product = product.to_ascii_lowercase();
+        if !SUPPORTED_BROWSER_PRODUCTS.contains(&product.as_str()) {
+            return Err(format!(
+                "unsupported browser product {product:?}; expected one of {}",
+                SUPPORTED_BROWSER_PRODUCTS.join(", ")
+            ));
+        }
+        if products.contains(&product) {
+            return Err(format!("duplicate browser product {product:?}"));
+        }
+        products.push(product);
+    }
+    if products.is_empty() {
+        return Err("at least one browser product is required".to_owned());
+    }
+    Ok(products)
+}
+
+fn requested_browser_products() -> Option<Vec<String>> {
+    let raw = std::env::var("CUA_E2E_BROWSER_PRODUCTS").ok()?;
+    Some(
+        parse_browser_products(&raw)
+            .unwrap_or_else(|error| panic!("invalid CUA_E2E_BROWSER_PRODUCTS={raw:?}: {error}")),
+    )
+}
+
+fn dedupe_browser_products(browsers: Vec<BrowserSpec>) -> Vec<BrowserSpec> {
+    browsers.into_iter().fold(Vec::new(), |mut unique, spec| {
+        if !unique
+            .iter()
+            .any(|existing: &BrowserSpec| existing.name == spec.name)
+        {
+            unique.push(spec);
+        }
+        unique
+    })
+}
+
+#[test]
+fn browser_product_selection_is_ordered_and_strict() {
+    assert_eq!(
+        parse_browser_products("Edge, chrome,chromium").unwrap(),
+        ["edge", "chrome", "chromium"]
+    );
+    assert!(parse_browser_products("").is_err());
+    assert!(parse_browser_products("chrome,chrome").is_err());
+    assert!(parse_browser_products("firefox").is_err());
+
+    let deduped = dedupe_browser_products(vec![
+        BrowserSpec {
+            name: "chromium".to_owned(),
+            executable: PathBuf::from("/first/chromium"),
+        },
+        BrowserSpec {
+            name: "edge".to_owned(),
+            executable: PathBuf::from("/edge"),
+        },
+        BrowserSpec {
+            name: "chromium".to_owned(),
+            executable: PathBuf::from("/second/chromium"),
+        },
+    ]);
+    assert_eq!(deduped.len(), 2);
+    assert_eq!(deduped[0].executable, PathBuf::from("/first/chromium"));
+}
+
+fn select_browser_products(
+    mut browsers: Vec<BrowserSpec>,
+    prefer_chrome_over_chromium: bool,
+) -> Vec<BrowserSpec> {
+    if let Some(requested) = requested_browser_products() {
+        let missing = requested
+            .iter()
+            .filter(|product| !browsers.iter().any(|spec| &spec.name == *product))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "requested standalone browser products were not found: {}",
+            missing.join(", ")
+        );
+        browsers.retain(|spec| requested.contains(&spec.name));
+        browsers.sort_by_key(|spec| {
+            requested
+                .iter()
+                .position(|product| product == &spec.name)
+                .unwrap_or(usize::MAX)
+        });
+    } else if prefer_chrome_over_chromium && browsers.iter().any(|spec| spec.name == "chrome") {
+        // Preserve the historical default lane: Chromium is the fallback when
+        // Chrome is absent. Certification runs opt into each product.
+        browsers.retain(|spec| spec.name != "chromium");
+    }
+    // A distro may expose one browser installation through several wrappers
+    // (for example /usr/bin/chromium-browser and /snap/bin/chromium). The
+    // certification matrix is product-scoped, so keep the first viable
+    // executable for each requested product instead of reporting duplicates.
+    dedupe_browser_products(browsers)
+}
+
 struct BrowserFixture {
     driver: McpDriver,
     server: BrowserFixtureServer,
@@ -183,38 +304,43 @@ fn browser_specs() -> Vec<BrowserSpec> {
             "CUA_E2E_BROWSER_BIN is not a file: {}",
             executable.display()
         );
-        let name = std::env::var("CUA_E2E_BROWSER_NAME").unwrap_or_else(|_| "chromium".to_owned());
-        return vec![BrowserSpec { name, executable }];
+        let name = std::env::var("CUA_E2E_BROWSER_NAME")
+            .unwrap_or_else(|_| "chromium".to_owned())
+            .to_ascii_lowercase();
+        return select_browser_products(vec![BrowserSpec { name, executable }], false);
     }
 
     #[cfg(target_os = "macos")]
     {
         let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
-        return [
-            (
-                "chrome",
-                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            ),
-            (
-                "chrome",
-                home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            ),
-            (
-                "edge",
-                PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
-            ),
-            (
-                "edge",
-                home.join("Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, executable)| executable.is_file())
-        .map(|(name, executable)| BrowserSpec {
-            name: name.to_owned(),
-            executable,
-        })
-        .collect();
+        select_browser_products(
+            [
+                (
+                    "chrome",
+                    PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                ),
+                (
+                    "chrome",
+                    home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                ),
+                (
+                    "edge",
+                    PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                ),
+                (
+                    "edge",
+                    home.join("Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, executable)| executable.is_file())
+            .map(|(name, executable)| BrowserSpec {
+                name: name.to_owned(),
+                executable,
+            })
+            .collect(),
+            false,
+        )
     }
     #[cfg(target_os = "linux")]
     {
@@ -223,6 +349,7 @@ fn browser_specs() -> Vec<BrowserSpec> {
             ("chromium", PathBuf::from("/usr/bin/chromium")),
             ("chromium", PathBuf::from("/usr/bin/chromium-browser")),
             ("edge", PathBuf::from("/usr/bin/microsoft-edge")),
+            ("edge", PathBuf::from("/usr/bin/microsoft-edge-stable")),
         ];
         if let Some(path) = std::env::var_os("PATH") {
             for (name, executable_name) in [
@@ -230,6 +357,7 @@ fn browser_specs() -> Vec<BrowserSpec> {
                 ("chromium", "chromium"),
                 ("chromium", "chromium-browser"),
                 ("edge", "microsoft-edge"),
+                ("edge", "microsoft-edge-stable"),
             ] {
                 if let Some(executable) = std::env::split_paths(&path)
                     .map(|directory| directory.join(executable_name))
@@ -239,7 +367,7 @@ fn browser_specs() -> Vec<BrowserSpec> {
                 }
             }
         }
-        let mut browsers = candidates
+        let browsers = candidates
             .into_iter()
             .filter(|(_, executable)| executable.is_file())
             .map(|(name, executable)| {
@@ -267,13 +395,7 @@ fn browser_specs() -> Vec<BrowserSpec> {
             .into_iter()
             .map(|(spec, _)| spec)
             .collect::<Vec<_>>();
-        // Chromium is the open-source fallback for environments without the
-        // Chrome stable channel. Do not expand a Chrome/Edge acceptance lane
-        // merely because the host image also exposes a Chromium package shim.
-        if browsers.iter().any(|spec| spec.name == "chrome") {
-            browsers.retain(|spec| spec.name != "chromium");
-        }
-        return browsers;
+        return select_browser_products(browsers, true);
     }
     #[cfg(target_os = "windows")]
     let candidates = {
@@ -286,35 +408,38 @@ fn browser_specs() -> Vec<BrowserSpec> {
         let local_app_data = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_default();
-        return [
-            (
-                "chrome",
-                program_files.join(r"Google\Chrome\Application\chrome.exe"),
-            ),
-            (
-                "chrome",
-                program_files_x86.join(r"Google\Chrome\Application\chrome.exe"),
-            ),
-            (
-                "chrome",
-                local_app_data.join(r"Google\Chrome\Application\chrome.exe"),
-            ),
-            (
-                "edge",
-                program_files_x86.join(r"Microsoft\Edge\Application\msedge.exe"),
-            ),
-            (
-                "edge",
-                program_files.join(r"Microsoft\Edge\Application\msedge.exe"),
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, executable)| executable.is_file())
-        .map(|(name, executable)| BrowserSpec {
-            name: name.to_owned(),
-            executable,
-        })
-        .collect();
+        return select_browser_products(
+            [
+                (
+                    "chrome",
+                    program_files.join(r"Google\Chrome\Application\chrome.exe"),
+                ),
+                (
+                    "chrome",
+                    program_files_x86.join(r"Google\Chrome\Application\chrome.exe"),
+                ),
+                (
+                    "chrome",
+                    local_app_data.join(r"Google\Chrome\Application\chrome.exe"),
+                ),
+                (
+                    "edge",
+                    program_files_x86.join(r"Microsoft\Edge\Application\msedge.exe"),
+                ),
+                (
+                    "edge",
+                    program_files.join(r"Microsoft\Edge\Application\msedge.exe"),
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, executable)| executable.is_file())
+            .map(|(name, executable)| BrowserSpec {
+                name: name.to_owned(),
+                executable,
+            })
+            .collect(),
+            false,
+        );
     };
 }
 
@@ -377,6 +502,24 @@ fn wait_for_browser_endpoint(port: u16) {
         );
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn record_browser_provenance(spec: &BrowserSpec, port: u16) {
+    let Some(path) = std::env::var_os("CUA_E2E_BROWSER_PROVENANCE_FILE") else {
+        return;
+    };
+    let version = browser_http_json(port, "/json/version")
+        .unwrap_or_else(|error| panic!("read browser provenance: {error}"));
+    let record = serde_json::json!({
+        "schema": "cua-driver-browser-provenance-v1",
+        "source_sha": std::env::var("CUA_E2E_SOURCE_SHA").ok(),
+        "product": spec.name,
+        "browser": version.get("Browser"),
+        "protocol_version": version.get("Protocol-Version"),
+        "user_agent": version.get("User-Agent"),
+    });
+    append_json_line(Path::new(&path), &record)
+        .unwrap_or_else(|error| panic!("write browser provenance: {error}"));
 }
 
 fn harness_cdp_call_at_url(
@@ -483,31 +626,28 @@ fn cdp_target_for_url(port: u16, url: &str) -> String {
         .to_owned()
 }
 
-fn bring_harness_page_to_front(port: u16, url: &str) {
+fn cdp_page_websocket_for_url(port: u16, url: &str) -> String {
     let targets = browser_http_json(port, "/json/list")
         .unwrap_or_else(|error| panic!("read harness CDP targets: {error}"));
-    let ws_url = targets
+    targets
         .as_array()
         .into_iter()
         .flatten()
         .find(|target| target["type"] == "page" && target["url"] == url)
         .and_then(|target| target["webSocketDebuggerUrl"].as_str())
-        .unwrap_or_else(|| panic!("no harness page websocket for {url}"));
-    harness_cdp_call_at_url(ws_url, "Page.bringToFront", serde_json::json!({}));
+        .unwrap_or_else(|| panic!("no harness page websocket for {url}"))
+        .to_owned()
+}
+
+fn bring_harness_page_to_front(port: u16, url: &str) {
+    let ws_url = cdp_page_websocket_for_url(port, url);
+    harness_cdp_call_at_url(&ws_url, "Page.bringToFront", serde_json::json!({}));
 }
 
 fn harness_page_visibility(port: u16, url: &str) -> String {
-    let targets = browser_http_json(port, "/json/list")
-        .unwrap_or_else(|error| panic!("read harness CDP targets: {error}"));
-    let ws_url = targets
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|target| target["type"] == "page" && target["url"] == url)
-        .and_then(|target| target["webSocketDebuggerUrl"].as_str())
-        .unwrap_or_else(|| panic!("no harness page websocket for {url}"));
+    let ws_url = cdp_page_websocket_for_url(port, url);
     harness_cdp_call_at_url(
-        ws_url,
+        &ws_url,
         "Runtime.evaluate",
         serde_json::json!({
             "expression": "document.visibilityState",
@@ -528,11 +668,11 @@ fn driver_profile_root() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        return PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+        PathBuf::from(std::env::var_os("HOME").expect("HOME"))
             .join("Library")
             .join("Application Support")
             .join("CuaDriver")
-            .join("BrowserProfiles");
+            .join("BrowserProfiles")
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -560,9 +700,48 @@ fn profile_entries(root: &Path) -> HashSet<std::ffi::OsString> {
 fn spawn_driver(label: &str) -> McpDriver {
     #[cfg(target_os = "macos")]
     let driver = McpDriver::spawn_macos_daemon_proxy_named(label);
-    #[cfg(not(target_os = "macos"))]
-    let driver = McpDriver::spawn_named(label);
+    #[cfg(target_os = "linux")]
+    let driver = if std::env::var("CUA_E2E_WAYLAND_SESSION").as_deref() == Ok("generic") {
+        // Keep Sway IPC available to the out-of-band test oracle while the
+        // product under test sees only standard/generic Wayland capabilities.
+        McpDriver::spawn_named_with_env(
+            label,
+            &[
+                ("SWAYSOCK", "/dev/null/cua-e2e-withheld"),
+                ("CUA_DRIVER_PERMISSION_MODE", "unrestricted"),
+                ("CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "1"),
+            ],
+        )
+    } else {
+        McpDriver::spawn_named_with_env(
+            label,
+            &[
+                ("CUA_DRIVER_PERMISSION_MODE", "unrestricted"),
+                ("CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "1"),
+            ],
+        )
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+    let driver = McpDriver::spawn_named_with_env(
+        label,
+        &[
+            ("CUA_DRIVER_PERMISSION_MODE", "unrestricted"),
+            ("CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "1"),
+        ],
+    );
     driver.expect("cua-driver binary/daemon is required for standalone browser E2E")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_standard_driver(label: &str) -> McpDriver {
+    McpDriver::spawn_named_with_env(
+        label,
+        &[
+            ("CUA_DRIVER_PERMISSION_MODE", "standard"),
+            ("CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "0"),
+        ],
+    )
+    .expect("cua-driver binary/daemon is required for standalone browser E2E")
 }
 
 #[cfg(target_os = "linux")]
@@ -570,8 +749,7 @@ fn configure_linux_browser_command(command: &mut Command) {
     command.arg("--password-store=basic");
     let native_wayland = std::env::var("XDG_SESSION_TYPE")
         .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
-        && std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("DISPLAY").is_none();
+        && std::env::var_os("WAYLAND_DISPLAY").is_some();
     if native_wayland {
         command.arg("--ozone-platform=wayland");
     }
@@ -585,7 +763,13 @@ fn configure_test_browser_sandbox(command: &mut Command) {
 
 #[cfg(target_os = "windows")]
 const TEST_BROWSER_WINDOW_SIZE: &str = "900,640";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "windows")]
+const TEST_BROWSER_HIGH_DPI_WINDOW_SIZE: &str = "440,300";
+#[cfg(target_os = "linux")]
+const TEST_BROWSER_WINDOW_SIZE: &str = "980,760";
+#[cfg(target_os = "linux")]
+const TEST_BROWSER_HIGH_DPI_WINDOW_SIZE: &str = "420,280";
+#[cfg(target_os = "macos")]
 const TEST_BROWSER_WINDOW_SIZE: &str = "980,760";
 
 #[cfg(target_os = "windows")]
@@ -599,13 +783,42 @@ fn command_for_browser(
     cdp_port: u16,
     url: &str,
     position: (i32, i32),
+    _force_high_device_scale: bool,
 ) -> Command {
     let mut command = Command::new(&spec.executable);
-    let output = if std::env::var_os("CUA_E2E_BROWSER_STDERR").is_some() {
-        Stdio::inherit()
+    let output = browser_stderr();
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let window_size = if _force_high_device_scale {
+        // Chromium applies the forced scale to the native window as well as
+        // the page and enforces a scaled minimum outer size. Keep the resulting
+        // physical bounds inside the interactive runner so the full-desktop
+        // sentinel can occlude every sampled point during the strict
+        // background-action proof.
+        TEST_BROWSER_HIGH_DPI_WINDOW_SIZE
     } else {
-        Stdio::null()
+        TEST_BROWSER_WINDOW_SIZE
     };
+    #[cfg(target_os = "windows")]
+    let window_position = if _force_high_device_scale {
+        // A scaled inset origin plus Chromium's minimum high-DPI outer width
+        // can extend past a small runner even when --window-size is smaller.
+        // Anchor this test-owned window at the display origin instead.
+        (0, 0)
+    } else {
+        position
+    };
+    #[cfg(target_os = "linux")]
+    // GNOME may horizontally maximize Chromium after applying server-side
+    // frame extents. Anchor this disposable fixture at the display origin so
+    // the full-screen sentinel covers the complete compositor-declared frame.
+    let window_position = {
+        let _ = position;
+        (0, 0)
+    };
+    #[cfg(target_os = "macos")]
+    let window_position = position;
+    #[cfg(target_os = "macos")]
+    let window_size = TEST_BROWSER_WINDOW_SIZE;
     command
         .arg(format!("--remote-debugging-port={cdp_port}"))
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -617,9 +830,14 @@ fn command_for_browser(
         .arg("--disable-default-apps")
         .arg("--site-per-process")
         .arg("--new-window")
-        .arg(format!("--window-position={},{}", position.0, position.1))
-        .arg(format!("--window-size={TEST_BROWSER_WINDOW_SIZE}"));
+        .arg(format!(
+            "--window-position={},{}",
+            window_position.0, window_position.1
+        ))
+        .arg(format!("--window-size={window_size}"));
     configure_test_browser_sandbox(&mut command);
+    #[cfg(target_os = "macos")]
+    configure_macos_test_browser_command(&mut command);
     #[cfg(target_os = "linux")]
     configure_linux_browser_command(&mut command);
     command.arg(url).stdout(Stdio::null()).stderr(output);
@@ -645,6 +863,8 @@ fn command_for_unprepared_browser(
         .arg(format!("--window-position={},{}", position.0, position.1))
         .arg(format!("--window-size={TEST_BROWSER_WINDOW_SIZE}"));
     configure_test_browser_sandbox(&mut command);
+    #[cfg(target_os = "macos")]
+    configure_macos_test_browser_command(&mut command);
     #[cfg(target_os = "linux")]
     {
         configure_linux_browser_command(&mut command);
@@ -657,8 +877,61 @@ fn command_for_unprepared_browser(
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(browser_stderr());
     command
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_test_browser_command(command: &mut Command) {
+    // Chromium's own macOS build guidance disables MediaRouter for tests to
+    // prevent its unrelated local-network system prompt from covering the
+    // browser UI under test. Cua Driver must still fail closed around an
+    // unexpected native prompt; this keeps the setup-success row focused on
+    // the exact remote-debugging page instead of pre-answering OS consent.
+    command.arg("--disable-features=MediaRouter");
+}
+
+fn browser_stderr() -> Stdio {
+    if std::env::var_os("CUA_E2E_BROWSER_STDERR").is_some() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_browser_commands_disable_unrelated_media_router_prompt() {
+    let spec = BrowserSpec {
+        name: "chrome".to_owned(),
+        executable: PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    };
+    let profile = Path::new("/tmp/cua-browser-command-test");
+    let prepared = command_for_browser(
+        &spec,
+        profile,
+        9222,
+        "about:blank",
+        TEST_BROWSER_INITIAL_POSITION,
+        false,
+    );
+    let unprepared = command_for_unprepared_browser(
+        &spec,
+        profile,
+        "about:blank",
+        TEST_BROWSER_INITIAL_POSITION,
+    );
+    for command in [&prepared, &unprepared] {
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--disable-features=MediaRouter"),
+            "{args:?}"
+        );
+    }
 }
 
 fn window_ids(driver: &mut McpDriver) -> HashSet<u64> {
@@ -704,6 +977,64 @@ fn wait_for_fixture_window(
             }
         }
         if Instant::now() >= deadline {
+            eprintln!(
+                "standalone browser fixture window timed out; before={before:?}; windows={}; journal={}",
+                windows.raw,
+                server.snapshot()
+            );
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn browser_app_name_matches(spec: &BrowserSpec, app_name: &str) -> bool {
+    let app_name = app_name.to_ascii_lowercase();
+    match spec.name.as_str() {
+        "chrome" => app_name.contains("chrome"),
+        "chromium" => app_name.contains("chromium"),
+        "edge" => app_name.contains("edge"),
+        _ => false,
+    }
+}
+
+fn wait_for_new_browser_window(
+    driver: &mut McpDriver,
+    before: &HashSet<u64>,
+    spec: &BrowserSpec,
+    launched_pid: u32,
+) -> Option<(u32, u64)> {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let windows = driver.call("list_windows", serde_json::json!({}));
+        if let Some(window) = windows.structured()["windows"]
+            .as_array()
+            .and_then(|windows| {
+                windows.iter().find(|window| {
+                    window["window_id"]
+                        .as_u64()
+                        .is_some_and(|id| !before.contains(&id))
+                        && window["is_on_screen"] == true
+                        && window["bounds"]["width"].as_f64().unwrap_or_default() > 0.0
+                        && window["bounds"]["height"].as_f64().unwrap_or_default() > 0.0
+                        && (window["pid"].as_u64() == Some(u64::from(launched_pid))
+                            || window["app_name"]
+                                .as_str()
+                                .is_some_and(|app_name| browser_app_name_matches(spec, app_name)))
+                })
+            })
+        {
+            return Some((
+                window["pid"].as_u64().expect("browser window pid") as u32,
+                window["window_id"].as_u64().expect("browser window id"),
+            ));
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "unprepared browser window timed out; product={}; launched_pid={launched_pid}; before={before:?}; windows={}",
+                spec.name,
+                windows.raw
+            );
             return None;
         }
         thread::sleep(Duration::from_millis(100));
@@ -776,8 +1107,19 @@ fn spawn_browser_command(
     cdp_port: u16,
     url: &str,
     position: (i32, i32),
+    force_high_device_scale: bool,
 ) {
-    let mut command = command_for_browser(spec, profile, cdp_port, url, position);
+    let mut command = command_for_browser(
+        spec,
+        profile,
+        cdp_port,
+        url,
+        position,
+        force_high_device_scale,
+    );
+    if force_high_device_scale {
+        command.arg("--force-device-scale-factor=2");
+    }
     let child = spawn_in_job(&mut command).expect("launch standalone browser");
     eprintln!(
         "[standalone-browser] spawned {} pid={} profile={} cdp_port={cdp_port}",
@@ -793,7 +1135,15 @@ fn launch_browser(spec: &BrowserSpec, label: &str) -> BrowserFixture {
 }
 
 fn launch_browser_with_html(spec: &BrowserSpec, label: &str, html: String) -> BrowserFixture {
-    let mut driver = spawn_driver(label);
+    launch_browser_with_driver(spec, label, html, spawn_driver(label))
+}
+
+fn launch_browser_with_driver(
+    spec: &BrowserSpec,
+    label: &str,
+    html: String,
+    mut driver: McpDriver,
+) -> BrowserFixture {
     let server = BrowserFixtureServer::start(&html);
     let profile = tempfile::Builder::new()
         .prefix("cua-e2e-browser-")
@@ -808,8 +1158,10 @@ fn launch_browser_with_html(spec: &BrowserSpec, label: &str, html: String) -> Br
         cdp_port,
         "about:blank",
         TEST_BROWSER_INITIAL_POSITION,
+        label.contains("multi-tab"),
     );
     navigate_initial_page(cdp_port, &server);
+    record_browser_provenance(spec, cdp_port);
     let window = wait_for_fixture_window(&mut driver, &before, &server);
     let (pid, window_id) = window.unwrap_or_else(|| {
         panic!(
@@ -839,13 +1191,20 @@ fn launch_unprepared_browser(spec: &BrowserSpec, label: &str) -> BrowserFixture 
     let mut command = command_for_unprepared_browser(
         spec,
         profile.path(),
-        server.page_url(),
+        "about:blank",
         TEST_BROWSER_INITIAL_POSITION,
     );
     let child = spawn_in_job(&mut command).expect("launch unprepared standalone browser");
+    let launched_pid = child.id();
+    eprintln!(
+        "[standalone-browser] spawned unprepared {} pid={} profile={}",
+        spec.name,
+        child.id(),
+        profile.path().display()
+    );
     driver.reaper().push(child);
-    let (pid, window_id) = wait_for_fixture_window(&mut driver, &before, &server)
-        .expect("unprepared browser fixture window");
+    let (pid, window_id) = wait_for_new_browser_window(&mut driver, &before, spec, launched_pid)
+        .expect("unprepared browser native window");
     driver.reaper().track_pid(pid);
     BrowserFixture {
         driver,
@@ -1043,6 +1402,30 @@ fn foreground_page_case(browser: &str, action: &str) -> CaseSpec {
         Scope::Window,
         DriverRoute::Cdp,
         vec![OracleKind::FixtureState],
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn generic_type_text_case(browser: &str) -> CaseSpec {
+    CaseSpec::delivered(
+        format!(
+            "{}-{browser}-standalone-generic-type-text-completion",
+            std::env::consts::OS
+        ),
+        browser,
+        "standalone-chromium",
+        "generic_type_text_completion",
+        Targeting::Px,
+        Delivery::Background,
+        Scope::Window,
+        DriverRoute::MacosCgEventPid,
+        vec![
+            OracleKind::FixtureState,
+            OracleKind::Focus,
+            OracleKind::ZOrder,
+            OracleKind::NoLeakedInput,
+            OracleKind::Cursor,
+        ],
     )
 }
 
@@ -1274,6 +1657,256 @@ fn run_background_type(spec: &BrowserSpec) {
     });
 }
 
+#[cfg(target_os = "macos")]
+fn native_omnibox(snapshot: &ToolResponse) -> (u64, f64, f64, String) {
+    let index = element_index_containing(snapshot.tree_text(), "Address and search bar")
+        .unwrap_or_else(|| panic!("native browser omnibox missing: {}", snapshot.tree_text()));
+    let elements = snapshot.structured()["elements"]
+        .as_array()
+        .expect("native window snapshot elements");
+    let element = elements
+        .iter()
+        .find(|element| element["element_index"].as_u64() == Some(index))
+        .unwrap_or_else(|| panic!("omnibox element [{index}] missing: {}", snapshot.raw));
+    let frame = element["frame"]
+        .as_object()
+        .unwrap_or_else(|| panic!("omnibox [{index}] has no frame: {}", snapshot.raw));
+    let window = elements
+        .iter()
+        .find(|element| element["role"] == "AXWindow")
+        .and_then(|element| element["frame"].as_object())
+        .unwrap_or_else(|| panic!("native browser window frame missing: {}", snapshot.raw));
+    let window_width = window["w"].as_f64().expect("browser window width");
+    let scale = snapshot.structured()["screenshot_width"]
+        .as_f64()
+        .expect("browser screenshot width")
+        / window_width;
+    let x = (frame["x"].as_f64().expect("omnibox x") - window["x"].as_f64().expect("window x")
+        + frame["w"].as_f64().expect("omnibox width") / 2.0)
+        * scale;
+    let y = (frame["y"].as_f64().expect("omnibox y") - window["y"].as_f64().expect("window y")
+        + frame["h"].as_f64().expect("omnibox height") / 2.0)
+        * scale;
+    (
+        index,
+        x,
+        y,
+        element["value"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_native_omnibox_value(fixture: &mut BrowserFixture, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = fixture.driver.call(
+            "get_window_state",
+            serde_json::json!({
+                "pid": fixture.pid as i64,
+                "window_id": fixture.window_id,
+                "capture_mode": "ax",
+            }),
+        );
+        let (_, _, _, value) = native_omnibox(&snapshot);
+        if value == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native omnibox value did not reach {expected:?}; actual={value:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_omnibox_select_all(spec: &BrowserSpec) {
+    let scenario = format!("macos-{}-native-omnibox-select-all", spec.name);
+    let case = CaseSpec::delivered(
+        scenario.clone(),
+        spec.name.clone(),
+        "standalone-chromium-native-chrome",
+        "hotkey_cmd_a_replace",
+        Targeting::Px,
+        Delivery::Foreground,
+        Scope::Window,
+        DriverRoute::MacosCgEventHid,
+        vec![OracleKind::FixtureState],
+    );
+    execute_case(case, |evidence| {
+        let mut fixture = launch_browser(spec, &scenario);
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        let snapshot = fixture.driver.call(
+            "get_window_state",
+            serde_json::json!({
+                "pid": fixture.pid as i64,
+                "window_id": fixture.window_id,
+                "capture_mode": "ax",
+            }),
+        );
+        let (index, x, y, _) = native_omnibox(&snapshot);
+        let initial = "cua-hotkey-initial";
+        let replacement = "cua-hotkey-replacement";
+        let seeded = fixture.driver.call(
+            "set_value",
+            serde_json::json!({
+                "pid": fixture.pid as i64,
+                "window_id": fixture.window_id,
+                "element_index": index,
+                "value": initial,
+            }),
+        );
+        assert!(!seeded.is_error(), "seed native omnibox: {}", seeded.raw);
+        wait_for_native_omnibox_value(&mut fixture, initial);
+
+        let selected = fixture.driver.call(
+            "hotkey",
+            serde_json::json!({
+                "pid": fixture.pid as i64,
+                "window_id": fixture.window_id,
+                "x": x,
+                "y": y,
+                "keys": ["cmd", "a"],
+                "delivery_mode": "foreground",
+            }),
+        );
+        assert!(
+            !selected.is_error(),
+            "native omnibox Cmd+A: {}",
+            selected.raw
+        );
+        assert_eq!(selected.verified(), Some(false), "{}", selected.raw);
+        assert_eq!(selected.structured()["effect"], "unverifiable");
+
+        let replaced = fixture.driver.call(
+            "type_text",
+            serde_json::json!({
+                "pid": fixture.pid as i64,
+                "window_id": fixture.window_id,
+                "x": x,
+                "y": y,
+                "text": replacement,
+                "delivery_mode": "foreground",
+            }),
+        );
+        assert!(
+            !replaced.is_error(),
+            "replace native omnibox: {}",
+            replaced.raw
+        );
+        wait_for_native_omnibox_value(&mut fixture, replacement);
+        Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn run_generic_type_text_completion(spec: &BrowserSpec) {
+    let scenario = format!(
+        "{}-{}-standalone-generic-type-text-completion",
+        std::env::consts::OS,
+        spec.name
+    );
+    execute_case(generic_type_text_case(&spec.name), |evidence| {
+        let mut fixture =
+            launch_browser_with_html(spec, &scenario, standalone_generic_type_text_html());
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        run_with_background_oracles(&mut fixture, |fixture| {
+            let state = fixture.driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid": fixture.pid as i64,
+                    "window_id": fixture.window_id,
+                    "capture_mode": "vision",
+                }),
+            );
+            assert!(!state.is_error(), "native browser snapshot: {}", state.raw);
+            let index = element_index_containing(state.tree_text(), "generic-long-editor")
+                .expect("generic long editor must be present in the native AX tree");
+            let elements = state.structured()["elements"]
+                .as_array()
+                .expect("native snapshot elements");
+            let editor_frame = elements
+                .iter()
+                .find(|element| element["element_index"].as_u64() == Some(index))
+                .and_then(|element| element["frame"].as_object())
+                .expect("generic long editor frame");
+            let window_frame = elements
+                .iter()
+                .find(|element| element["role"].as_str() == Some("AXWindow"))
+                .and_then(|element| element["frame"].as_object())
+                .expect("browser AXWindow frame");
+            let window_x = window_frame["x"].as_f64().expect("window x");
+            let window_y = window_frame["y"].as_f64().expect("window y");
+            let window_width = window_frame["w"].as_f64().expect("window width");
+            let scale = state.structured()["screenshot_width"]
+                .as_f64()
+                .expect("screenshot width")
+                / window_width;
+            let x = (editor_frame["x"].as_f64().expect("editor x")
+                + editor_frame["w"].as_f64().expect("editor width") / 2.0
+                - window_x)
+                * scale;
+            let y = (editor_frame["y"].as_f64().expect("editor y")
+                + editor_frame["h"].as_f64().expect("editor height") / 2.0
+                - window_y)
+                * scale;
+
+            let payload = format!("BEGIN-{}-END", "0123456789abcdef".repeat(52));
+            let requested_chars = payload.chars().count();
+            let typed = fixture.driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": fixture.pid as i64,
+                    "window_id": fixture.window_id,
+                    "x": x,
+                    "y": y,
+                    "text": payload,
+                    "delay_ms": 0,
+                }),
+            );
+            assert!(
+                !typed.is_error(),
+                "generic long type_text failed: {}",
+                typed.raw
+            );
+            assert_eq!(
+                typed.structured()["requested_chars"].as_u64(),
+                Some(requested_chars as u64),
+                "{}",
+                typed.raw
+            );
+            assert_eq!(
+                typed.structured()["delivered_chars"].as_u64(),
+                Some(requested_chars as u64),
+                "{}",
+                typed.raw
+            );
+
+            // Read the DOM synchronously after type_text returns. No fixture
+            // polling is allowed here: the tool's completion is the behavior
+            // under test, and the distinctive END sentinel proves the queued
+            // renderer tail was consumed before it returned.
+            let ws_url = cdp_page_websocket_for_url(fixture.cdp_port, fixture.server.page_url());
+            let value = harness_cdp_call_at_url(
+                &ws_url,
+                "Runtime.evaluate",
+                serde_json::json!({
+                    "expression": "document.getElementById('generic-long-editor').innerText",
+                    "returnByValue": true,
+                }),
+            )["result"]["value"]
+                .as_str()
+                .expect("generic long editor DOM value")
+                .to_owned();
+            assert_eq!(value.chars().count(), requested_chars);
+            assert!(value.ends_with("-END"), "missing END sentinel: {value:?}");
+            assert_eq!(value, payload);
+
+            Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+        })
+    });
+}
+
 fn run_trusted_click(spec: &BrowserSpec) {
     let scenario = format!(
         "{}-{}-standalone-trusted-click",
@@ -1313,6 +1946,18 @@ fn run_trusted_click(spec: &BrowserSpec) {
                     "{}",
                     click.raw
                 );
+                assert_eq!(
+                    click.structured()["refusal"]["detail"]["alternative_route"],
+                    "dom_event",
+                    "{}",
+                    click.raw
+                );
+                assert_eq!(
+                    click.structured()["refusal"]["detail"]["trusted_delivery_attempted"],
+                    false,
+                    "{}",
+                    click.raw
+                );
                 wait_for_text(&fixture.server, "lbl-counter", "counter=0");
                 Observation::refused(
                     RefusalCode::BrowserInputTrustUnavailable,
@@ -1338,7 +1983,6 @@ fn run_prepare_isolated_launch(spec: &BrowserSpec) {
     execute_case(
         case(&spec.name, "browser_prepare_isolated_launch"),
         |evidence| {
-            let source_server = BrowserFixtureServer::start(&standalone_fixture_html());
             let target_server = BrowserFixtureServer::start(&standalone_fixture_html());
             let source_profile = tempfile::Builder::new()
                 .prefix("cua-e2e-user-browser-")
@@ -1353,14 +1997,21 @@ fn run_prepare_isolated_launch(spec: &BrowserSpec) {
             let mut source_command = command_for_unprepared_browser(
                 spec,
                 source_profile.path(),
-                source_server.page_url(),
+                "about:blank",
                 TEST_BROWSER_INITIAL_POSITION,
             );
             let source_child = spawn_in_job(&mut source_command).expect("launch ordinary browser");
+            let launched_pid = source_child.id();
+            eprintln!(
+                "[standalone-browser] spawned ordinary {} pid={} profile={}",
+                spec.name,
+                source_child.id(),
+                source_profile.path().display()
+            );
             driver.reaper().push(source_child);
             let (source_pid, source_window_id) =
-                wait_for_fixture_window(&mut driver, &before, &source_server)
-                    .expect("ordinary browser fixture window");
+                wait_for_new_browser_window(&mut driver, &before, spec, launched_pid)
+                    .expect("ordinary browser native window");
             driver.reaper().track_pid(source_pid);
 
             let session = format!("standalone-prepare-{source_pid}");
@@ -1466,7 +2117,6 @@ fn run_prepare_isolated_launch(spec: &BrowserSpec) {
                     );
                     assert_eq!(clicked.structured()["status"], "ok", "{}", clicked.raw);
                     wait_for_text(&target_server, "lbl-counter", "counter=1");
-                    wait_for_text(&source_server, "lbl-counter", "counter=0");
                     let source_windows =
                         driver.call("list_windows", serde_json::json!({"pid": source_pid}));
                     assert!(
@@ -1502,6 +2152,72 @@ fn run_prepare_isolated_launch(spec: &BrowserSpec) {
     );
 }
 
+#[cfg(not(target_os = "macos"))]
+fn run_existing_profile_standard_refusal(spec: &BrowserSpec) {
+    let scenario = format!(
+        "{}-{}-standalone-existing-profile-standard-refusal",
+        std::env::consts::OS,
+        spec.name
+    );
+    execute_case(
+        refusal_case(
+            &spec.name,
+            "browser_prepare_existing_profile_standard_refusal",
+            RefusalCode::BrowserConsentRequired,
+        ),
+        |evidence| {
+            // Fixture discovery, posture, and evidence capture are protected
+            // desktop operations in their own right. Keep those on the
+            // explicitly unrestricted disposable-test driver, then use a
+            // separate standard daemon solely as the authorization subject.
+            let mut fixture = launch_browser(spec, &scenario);
+            let mut standard_driver =
+                spawn_standard_driver(&format!("{scenario}-authorization-subject"));
+            fixture.driver.start_behavior_recording();
+            *evidence = recording_evidence(fixture.driver.recording_dir());
+            run_with_background_oracles(&mut fixture, |fixture| {
+                let session = format!("standalone-standard-refusal-{}", fixture.pid);
+                let started = standard_driver
+                    .call("start_session", serde_json::json!({ "session": session }));
+                assert!(!started.is_error(), "start_session failed: {}", started.raw);
+
+                let refused = standard_driver.call(
+                    "browser_prepare",
+                    serde_json::json!({
+                        "pid": fixture.pid as i64,
+                        "window_id": fixture.window_id,
+                        "session": session,
+                        "strategy": {"kind": "existing_profile"},
+                    }),
+                );
+                assert_eq!(
+                    refused.structured()["refusal"]["code"],
+                    "browser_consent_required",
+                    "{}",
+                    refused.raw
+                );
+                assert_eq!(
+                    refused.structured()["refusal"]["detail"]["permission_mode"],
+                    "standard",
+                    "{}",
+                    refused.raw
+                );
+                wait_for_text(&fixture.server, "lbl-counter", "counter=0");
+                let observation = Observation::refused(
+                    RefusalCode::BrowserConsentRequired,
+                    vec![OracleKind::FixtureState],
+                    refused.text(),
+                    Evidence::default(),
+                );
+                let ended =
+                    standard_driver.call("end_session", serde_json::json!({ "session": session }));
+                assert!(!ended.is_error(), "end_session failed: {}", ended.raw);
+                observation
+            })
+        },
+    );
+}
+
 fn run_existing_profile_attach(spec: &BrowserSpec) {
     let scenario = format!(
         "{}-{}-standalone-existing-profile",
@@ -1520,30 +2236,6 @@ fn run_existing_profile_attach(spec: &BrowserSpec) {
                     .call("start_session", serde_json::json!({ "session": session }));
                 assert!(!started.is_error(), "start_session failed: {}", started.raw);
 
-                // A live MCP proxy proves transport provenance, not a person's
-                // approval to attach an authenticated profile.
-                let unapproved = fixture.driver.call(
-                    "browser_prepare",
-                    serde_json::json!({
-                        "pid": fixture.pid as i64,
-                        "window_id": fixture.window_id,
-                        "session": session,
-                        "strategy": {"kind": "existing_profile"},
-                    }),
-                );
-                assert_eq!(
-                    unapproved.structured()["refusal"]["code"],
-                    "browser_consent_required",
-                    "{}",
-                    unapproved.raw
-                );
-
-                let approval_token = mint_existing_profile_approval(ExistingProfileApprovalScope {
-                    pid: fixture.pid as i64,
-                    window_id: fixture.window_id,
-                    session: session.clone(),
-                })
-                .expect("mint exact existing-profile approval");
                 fixture.driver.start_behavior_recording();
                 let prepared = fixture.driver.call(
                     "browser_prepare",
@@ -1552,7 +2244,6 @@ fn run_existing_profile_attach(spec: &BrowserSpec) {
                         "window_id": fixture.window_id,
                         "session": session,
                         "strategy": {"kind": "existing_profile"},
-                        "approval_token": approval_token,
                     }),
                 );
                 assert_eq!(prepared.structured()["status"], "ok", "{}", prepared.raw);
@@ -1594,7 +2285,11 @@ fn run_existing_profile_attach(spec: &BrowserSpec) {
                     "{}",
                     prepared.raw
                 );
-                assert!(!public_result.contains(&approval_token), "{}", prepared.raw);
+                assert!(
+                    !public_result.contains("approval_token"),
+                    "{}",
+                    prepared.raw
+                );
                 assert!(
                     !public_result.contains(&fixture._profile.path().display().to_string()),
                     "{}",
@@ -1687,12 +2382,6 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                 .call("start_session", serde_json::json!({ "session": session }));
             assert!(!started.is_error(), "start_session failed: {}", started.raw);
 
-            let approval_token = mint_existing_profile_approval(ExistingProfileApprovalScope {
-                pid: fixture.pid as i64,
-                window_id: fixture.window_id,
-                session: session.clone(),
-            })
-            .expect("mint exact existing-profile setup approval");
             fixture.driver.start_behavior_recording();
             let prepared = fixture.driver.call(
                 "browser_prepare",
@@ -1701,7 +2390,6 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                     "window_id": fixture.window_id,
                     "session": session,
                     "strategy": {"kind": "existing_profile"},
-                    "approval_token": approval_token,
                 }),
             );
             assert_eq!(prepared.structured()["status"], "ok", "{}", prepared.raw);
@@ -1729,6 +2417,11 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                 "{}",
                 prepared.raw
             );
+            assert!(
+                prepared.structured()["side_effects"]["used_bounded_pixel_fallback"].is_boolean(),
+                "{}",
+                prepared.raw
+            );
             assert_eq!(
                 prepared.structured()["side_effects"]["launched_browser"],
                 false
@@ -1740,7 +2433,11 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
 
             let public_result = prepared.raw.to_string();
             assert!(!public_result.contains("ws://"), "{}", prepared.raw);
-            assert!(!public_result.contains(&approval_token), "{}", prepared.raw);
+            assert!(
+                !public_result.contains("approval_token"),
+                "{}",
+                prepared.raw
+            );
             assert!(
                 !public_result.contains(&fixture._profile.path().display().to_string()),
                 "{}",
@@ -1772,6 +2469,17 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                     .and_then(|tab| tab["tab_id"].as_str())
                     .expect("existing-profile setup active tab")
                     .to_owned();
+                let navigated = fixture.driver.call(
+                    "browser_navigate",
+                    serde_json::json!({
+                        "target_id": target,
+                        "tab_id": tab,
+                        "url": fixture.server.page_url(),
+                        "session": session,
+                    }),
+                );
+                assert_eq!(navigated.structured()["status"], "ok", "{}", navigated.raw);
+                wait_for_observed(&fixture.server, "WEB_HARNESS_MARKER_v1");
                 let snapshot = fixture.driver.call(
                     "get_browser_state",
                     serde_json::json!({
@@ -1812,6 +2520,111 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                 );
                 Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
             })
+        },
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn run_generic_wayland_existing_profile_refusal(spec: &BrowserSpec) {
+    assert!(
+        std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && std::env::var("CUA_E2E_WAYLAND_SESSION").as_deref() == Ok("generic"),
+        "the generic-Wayland refusal row requires its explicit native-Wayland lane"
+    );
+    assert!(
+        platform_linux::wayland::shell_helper::trusted_window_ids_for_pid(std::process::id())
+            .is_none(),
+        "the generic-Wayland refusal row requires the attested GNOME helper to be unavailable"
+    );
+    let scenario = format!(
+        "{}-{}-standalone-generic-wayland-existing-profile-refusal",
+        std::env::consts::OS,
+        spec.name
+    );
+    execute_case(
+        refusal_case(
+            &spec.name,
+            "browser_prepare_existing_profile_generic_wayland",
+            RefusalCode::BrowserRouteUnavailable,
+        ),
+        |evidence| {
+            let mut driver = spawn_driver(&scenario);
+            let server = BrowserFixtureServer::start(&standalone_fixture_html());
+            let profile = tempfile::Builder::new()
+                .prefix("cua-e2e-generic-wayland-browser-")
+                .tempdir()
+                .expect("create generic Wayland browser profile");
+            let mut command = command_for_unprepared_browser(
+                spec,
+                profile.path(),
+                server.page_url(),
+                TEST_BROWSER_INITIAL_POSITION,
+            );
+            let child = spawn_in_job(&mut command).expect("launch generic Wayland browser");
+            let pid = child.id();
+            driver.reaper().push(child);
+            driver.reaper().track_pid(pid);
+            wait_for_observed(&server, "WEB_HARNESS_MARKER_v1");
+
+            let windows = driver.call("list_windows", serde_json::json!({"pid": pid}));
+            let opaque_window = windows.structured()["windows"]
+                .as_array()
+                .and_then(|windows| windows.iter().find(|window| window["pid"] == pid))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "generic Wayland did not expose the browser's opaque native window: {}",
+                        windows.raw
+                    )
+                });
+            let opaque_unattested_window_id = opaque_window["window_id"]
+                .as_u64()
+                .expect("opaque generic Wayland window id");
+            assert!(
+                opaque_window["z_index"].is_null(),
+                "generic Wayland must not treat an AT-SPI window as compositor-attested: {}",
+                windows.raw
+            );
+
+            let sentinel = ForegroundSentinel::launch(&mut driver);
+            *evidence = recording_evidence(driver.recording_dir());
+            driver.start_behavior_recording();
+            let (mut observation, passed) = sentinel
+                .observe_desktop(|| {
+                    let session = format!("generic-wayland-refusal-{pid}");
+                    let started =
+                        driver.call("start_session", serde_json::json!({ "session": session }));
+                    assert!(!started.is_error(), "start_session failed: {}", started.raw);
+                    let refused = driver.call(
+                        "browser_prepare",
+                        serde_json::json!({
+                            "pid": pid as i64,
+                            "window_id": opaque_unattested_window_id,
+                            "session": session,
+                            "strategy": {"kind": "existing_profile"},
+                        }),
+                    );
+                    assert_eq!(
+                        refused.structured()["refusal"]["code"],
+                        "browser_route_unavailable",
+                        "{}",
+                        refused.raw
+                    );
+                    assert!(
+                        refused.structured()["refusal"]["detail"]["setup_side_effects"].is_null(),
+                        "generic Wayland must refuse before setup mutation: {}",
+                        refused.raw
+                    );
+                    wait_for_text(&server, "lbl-counter", "counter=0");
+                    Observation::refused(
+                        RefusalCode::BrowserRouteUnavailable,
+                        vec![OracleKind::FixtureState],
+                        refused.text(),
+                        Evidence::default(),
+                    )
+                })
+                .expect("observe generic Wayland refusal desktop effects");
+            observation.passed_oracles.extend(passed);
+            observation
         },
     );
 }
@@ -1955,10 +2768,15 @@ fn run_multi_tab(spec: &BrowserSpec) {
         *evidence = recording_evidence(fixture.driver.recording_dir());
         let session = format!("standalone-multi-tab-{}", fixture.pid);
         let _ = bind(&mut fixture, &session);
-        let second_html = standalone_fixture_html().replace(
-            "<title>cua-driver Web Harness</title>",
-            "<title>cua-driver Background Harness</title>",
-        );
+        let second_html = standalone_fixture_html()
+            .replace(
+                "<title>cua-driver Web Harness</title>",
+                "<title>cua-driver Background Harness</title>",
+            )
+            .replace(
+                "</style>",
+                "body { background: rgb(18, 171, 52) !important; }</style>",
+            );
         let second_server = BrowserFixtureServer::start(&second_html);
         let created = harness_cdp_call(
             fixture.cdp_port,
@@ -1972,12 +2790,29 @@ fn run_multi_tab(spec: &BrowserSpec) {
         assert!(created["targetId"].is_string(), "{created}");
         wait_for_observed(&second_server, "WEB_HARNESS_MARKER_v1");
 
+        // The multi-tab fixture launches Chromium with a non-1 device scale so
+        // screenshot/coordinate parity is exercised consistently in headful
+        // Chrome and Edge. Verify the launch flag reached this exact tab before
+        // starting the background sentinel.
+        let background_ws = cdp_page_websocket_for_url(fixture.cdp_port, second_server.page_url());
+        let device_scale = harness_cdp_call_at_url(
+            &background_ws,
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": "window.devicePixelRatio",
+                "returnByValue": true,
+            }),
+        )["result"]["value"]
+            .as_f64()
+            .expect("background tab device scale factor");
+        assert!((device_scale - 2.0).abs() < f64::EPSILON, "{device_scale}");
+
         // Establish a deterministic selected-tab baseline before the
         // foreground sentinel starts. Chromium does not consistently honor
         // createTarget(background=true) on every host, but Page.bringToFront
         // reliably selects the fixture tab. No browser action below this
         // setup point may activate a target.
-        bring_harness_page_to_front(fixture.cdp_port, &fixture.server.page_url());
+        bring_harness_page_to_front(fixture.cdp_port, fixture.server.page_url());
 
         // Begin the background proof only after Chromium has honored the
         // explicit selected-tab setup and the first fixture is observably
@@ -1985,9 +2820,9 @@ fn run_multi_tab(spec: &BrowserSpec) {
         let setup_deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let foreground_visibility =
-                harness_page_visibility(fixture.cdp_port, &fixture.server.page_url());
+                harness_page_visibility(fixture.cdp_port, fixture.server.page_url());
             let background_visibility =
-                harness_page_visibility(fixture.cdp_port, &second_server.page_url());
+                harness_page_visibility(fixture.cdp_port, second_server.page_url());
             if foreground_visibility == "visible" && background_visibility == "hidden" {
                 break;
             }
@@ -2059,9 +2894,113 @@ fn run_multi_tab(spec: &BrowserSpec) {
                     "session": session,
                     "snapshot_format": "semantic_v2",
                     "query": "Increment txt-input",
+                    "include_screenshot": true,
                 }),
             );
             assert_eq!(snapshot.structured()["status"], "ok", "{}", snapshot.raw);
+            assert_eq!(
+                snapshot.structured()["screenshot"]["source"],
+                "cdp_tab",
+                "{}",
+                snapshot.raw
+            );
+            assert!(
+                snapshot.structured()["screenshot"]["width"]
+                    .as_u64()
+                    .is_some_and(|width| width > 0)
+                    && snapshot.structured()["screenshot"]["height"]
+                        .as_u64()
+                        .is_some_and(|height| height > 0),
+                "{}",
+                snapshot.raw
+            );
+            assert_eq!(
+                snapshot.structured()["screenshot_width"],
+                snapshot.structured()["screenshot"]["width"]
+            );
+            assert_eq!(
+                snapshot.structured()["screenshot_height"],
+                snapshot.structured()["screenshot"]["height"]
+            );
+            assert_eq!(snapshot.structured()["screenshot_mime_type"], "image/png");
+            assert_eq!(
+                snapshot.structured()["screenshot"]["coordinate_space"],
+                "viewport_css_px"
+            );
+            let png_width = snapshot.structured()["screenshot"]["width"]
+                .as_f64()
+                .expect("PNG width");
+            let png_height = snapshot.structured()["screenshot"]["height"]
+                .as_f64()
+                .expect("PNG height");
+            let viewport_width = snapshot.structured()["screenshot"]["viewport_css_width"]
+                .as_f64()
+                .expect("CSS viewport width");
+            let viewport_height = snapshot.structured()["screenshot"]["viewport_css_height"]
+                .as_f64()
+                .expect("CSS viewport height");
+            let pixel_to_css_x = snapshot.structured()["screenshot"]["pixel_to_css_scale_x"]
+                .as_f64()
+                .expect("screenshot x scale");
+            let pixel_to_css_y = snapshot.structured()["screenshot"]["pixel_to_css_scale_y"]
+                .as_f64()
+                .expect("screenshot y scale");
+            assert!(
+                viewport_width > 0.0 && viewport_height > 0.0,
+                "{}",
+                snapshot.raw
+            );
+            assert!(
+                (pixel_to_css_x - viewport_width / png_width).abs() < 1e-9,
+                "{}",
+                snapshot.raw
+            );
+            assert!(
+                (pixel_to_css_y - viewport_height / png_height).abs() < 1e-9,
+                "{}",
+                snapshot.raw
+            );
+            assert!(
+                (pixel_to_css_x - 1.0 / device_scale).abs() < 1e-9
+                    && (pixel_to_css_y - 1.0 / device_scale).abs() < 1e-9,
+                "{}",
+                snapshot.raw
+            );
+            assert!(
+                snapshot.raw["result"]["content"]
+                    .as_array()
+                    .is_some_and(|content| content.iter().any(|item| {
+                        item["type"] == "image"
+                            && item["mimeType"] == "image/png"
+                            && item["data"]
+                                .as_str()
+                                .is_some_and(|data| data.starts_with("iVBOR"))
+                    })),
+                "{}",
+                snapshot.raw
+            );
+            let screenshot_data = snapshot.raw["result"]["content"]
+                .as_array()
+                .and_then(|content| {
+                    content
+                        .iter()
+                        .find(|item| item["type"] == "image")
+                        .and_then(|item| item["data"].as_str())
+                })
+                .expect("inactive-tab PNG data");
+            let screenshot_bytes = base64::engine::general_purpose::STANDARD
+                .decode(screenshot_data)
+                .expect("decode inactive-tab PNG");
+            let screenshot = image::load_from_memory(&screenshot_bytes)
+                .expect("decode inactive-tab image")
+                .to_rgba8();
+            let pixel = screenshot.get_pixel(2, 2).0;
+            assert!(
+                pixel[0].abs_diff(18) <= 2
+                    && pixel[1].abs_diff(171) <= 2
+                    && pixel[2].abs_diff(52) <= 2,
+                "screenshot did not come from the green inactive tab: rgba={pixel:?}"
+            );
             let click_ref = semantic_ref_by_name(&snapshot, "Increment", "click");
             let trusted = fixture.driver.call(
                 "browser_click",
@@ -2223,7 +3162,7 @@ fn run_same_title_tabs(spec: &BrowserSpec) {
             );
             assert!(created["targetId"].is_string(), "{created}");
             wait_for_observed(&second_server, "WEB_HARNESS_MARKER_v1");
-            bring_harness_page_to_front(fixture.cdp_port, &fixture.server.page_url());
+            bring_harness_page_to_front(fixture.cdp_port, fixture.server.page_url());
 
             run_with_background_oracles(&mut fixture, |fixture| {
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -2670,7 +3609,20 @@ fn run_download(spec: &BrowserSpec) {
         run_with_background_oracles(&mut fixture, |fixture| {
             let session = format!("standalone-download-{}", fixture.pid);
             let (target, tab, snapshot) = bind(fixture, &session);
-            let destination = tempfile::tempdir().expect("create approved download directory");
+            // Sandboxed browser packages such as Ubuntu's Chromium snap use a
+            // private /tmp namespace. A temporary directory under HOME remains
+            // visible to both the browser and the driver while still being
+            // removed automatically when the fixture exits.
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(PathBuf::from)
+                .expect("browser E2E home directory");
+            let destination = tempfile::Builder::new()
+                // Snap grants ordinary home-directory access but intentionally
+                // excludes arbitrary dotfiles and hidden directories.
+                .prefix("cua-e2e-download-")
+                .tempdir_in(home)
+                .expect("create approved download directory");
             let canonical =
                 std::fs::canonicalize(destination.path()).expect("canonical download directory");
             let downloaded = fixture.driver.call(
@@ -2822,10 +3774,25 @@ macro_rules! standalone_browser_test {
 standalone_browser_test!(standalone_browser_roundtrip, run_roundtrip);
 standalone_browser_test!(standalone_browser_semantic_state, run_semantic_state);
 standalone_browser_test!(standalone_browser_background_type, run_background_type);
+#[cfg(target_os = "macos")]
+standalone_browser_test!(
+    standalone_browser_native_omnibox_select_all,
+    run_native_omnibox_select_all
+);
+#[cfg(target_os = "macos")]
+standalone_browser_test!(
+    standalone_browser_generic_type_text_completion,
+    run_generic_type_text_completion
+);
 standalone_browser_test!(standalone_browser_trusted_click, run_trusted_click);
 standalone_browser_test!(
     standalone_browser_prepare_isolated,
     run_prepare_isolated_launch
+);
+#[cfg(not(target_os = "macos"))]
+standalone_browser_test!(
+    standalone_browser_existing_profile_standard_refusal,
+    run_existing_profile_standard_refusal
 );
 standalone_browser_test!(
     standalone_browser_existing_profile,
@@ -2834,6 +3801,11 @@ standalone_browser_test!(
 standalone_browser_test!(
     standalone_browser_existing_profile_setup,
     run_existing_profile_setup
+);
+#[cfg(target_os = "linux")]
+standalone_browser_test!(
+    standalone_browser_generic_wayland_existing_profile_refusal,
+    run_generic_wayland_existing_profile_refusal
 );
 standalone_browser_test!(standalone_browser_stale_ref, run_stale_ref);
 standalone_browser_test!(standalone_browser_frames, run_frame_roundtrip);

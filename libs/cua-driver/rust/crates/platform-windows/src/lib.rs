@@ -18,10 +18,21 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
+#[cfg(target_os = "windows")]
+pub fn protected_consent_event(event: &overlay_ui::HelperEvent) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, event)?;
+    std::io::Write::write_all(&mut stdout, b"\n")?;
+    std::io::Write::flush(&mut stdout)?;
+    Ok(())
+}
+
 pub mod diagnostics;
 pub mod health_report;
 pub mod overlay;
 pub mod pip;
+#[cfg(target_os = "windows")]
+pub mod protected_consent;
 pub mod recording_hooks;
 pub mod terminal;
 pub mod tools;
@@ -31,6 +42,9 @@ pub mod tools;
 // unit tests run on any host (no Win32 runtime needed) — see issue #1979,
 // where the multi-monitor normalization bug was diagnosable by pure math.
 pub mod virtualdesk;
+
+#[cfg(any(target_os = "windows", test))]
+mod keycodes;
 
 // Cross-platform: pure math for packing `(x, y)` into the `LPARAM` payload
 // every `WM_MOUSE*` / `WM_*BUTTON*` message carries. Lives outside the
@@ -78,9 +92,17 @@ pub fn register_tools() -> ToolRegistry {
 /// (pid + window_id required, JPEG @ 85%, text note pointing at pixel
 /// tools). See `tools::impl_::ScreenshotCompatTool`.
 pub fn register_tools_with_cursor(cfg: cursor_overlay::CursorConfig, compat: bool) -> ToolRegistry {
+    register_tools_with_cursor_and_provider(None, cfg, compat)
+}
+
+pub fn register_tools_with_cursor_and_provider(
+    provider: Option<std::sync::Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
+    cfg: cursor_overlay::CursorConfig,
+    compat: bool,
+) -> ToolRegistry {
     if cfg.enabled {
         overlay::init(cfg.clone());
         overlay::run_on_thread();
     }
-    tools::build_registry(compat)
+    tools::build_registry_with_provider(compat, provider)
 }

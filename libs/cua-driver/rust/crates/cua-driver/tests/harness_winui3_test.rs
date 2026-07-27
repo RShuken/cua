@@ -6,12 +6,10 @@
 //! shows up in both suites.
 //!
 //! WinUI3-specific surfaces under test:
-//!   - CommandBarFlyout : popup hosted in same HWND, rendered via XAML
-//!                        Islands / DComp. Tests UIA descent into the
-//!                        flyout subtree.
-//!   - XAML Popup       : Popup primitive (NOT a separate HWND).
-//!                        Regression guard that the agent doesn't lose
-//!                        track of in-window flyouts.
+//! - CommandBarFlyout: popup hosted in same HWND, rendered via XAML Islands /
+//!   DComp. Tests UIA descent into the flyout subtree.
+//! - XAML Popup: Popup primitive (NOT a separate HWND). Regression guard that
+//!   the agent doesn't lose track of in-window flyouts.
 //!
 //! Run via:
 //!   ..\tests\runners\windows-sandbox\run-tests-in-sandbox.ps1 harness_winui3
@@ -250,7 +248,7 @@ fn harness_winui3_xaml_popup_open() {
 /// Regression guard for the click → TogglePattern dispatch fix.
 /// cua-driver `click` now tries Invoke → Toggle → SelectionItem →
 /// ExpandCollapse before falling through to PostMessage, so WinUI3
-/// CheckBox toggles correctly via UIA without needing dispatch:foreground.
+/// CheckBox toggles correctly via UIA without needing delivery_mode:foreground.
 #[test]
 #[ignore]
 fn harness_winui3_checkbox_toggle() {

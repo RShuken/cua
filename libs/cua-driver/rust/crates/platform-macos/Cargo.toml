@@ -19,7 +19,9 @@ uuid = { workspace = true }
 # to frame (a plain HashMap would flicker overlapping cursors).
 indexmap = "2"
 cua-driver-core = { path = "../cua-driver-core" }
+cua-driver-contract = { path = "../cua-driver-contract" }
 cursor-overlay = { path = "../cursor-overlay" }
+overlay-ui = { path = "../overlay-ui" }
 pip-preview = { path = "../pip-preview" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -10,6 +10,7 @@
       "release-type": "simple",
       "component": "cua-driver-rs",
       "package-name": "cua-driver-rs",
+      "bump-minor-pre-major": true,
       "version-file": "rust/VERSION",
       "changelog-path": "rust/CHANGELOG.md",
       "exclude-paths": [
@@ -33,12 +34,31 @@
           "path": "python/src/cua_driver/__init__.py"
         },
         {
+          "type": "json",
+          "path": "typescript/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "typescript/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "typescript/package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        },
+        {
           "type": "generic",
           "path": "scripts/_install-rust.sh"
         },
         {
           "type": "generic",
           "path": "scripts/install.ps1"
+        },
+        {
+          "type": "generic",
+          "path": "rust/Skills/cua-driver/SKILL.md"
         }
       ]
     },

@@ -3,8 +3,6 @@ title: Browser Profile Attachment
 description: Contract, lifetimes, refusals, and platform scope for attaching Cua Driver to an existing Chromium profile.
 ---
 
-# Browser Profile Attachment
-
 Existing-profile attachment is an additive `browser_prepare` strategy. It does
 not change the lifecycle of driver-owned `isolated_new` and `isolated_named`
 profiles.
@@ -16,41 +14,64 @@ profiles.
   "pid": 844,
   "window_id": 10725,
   "session": "research-1",
-  "strategy": {"kind": "existing_profile"},
-  "approval_token": "<interactive one-use token>"
+  "strategy": { "kind": "existing_profile" },
 }
 ```
 
 `pid`, `window_id`, and `session` are required. `strategy` cannot be combined
-with legacy `allow_launch` or `profile` fields. The approval token must be
-minted by `cua-driver browser-approve` for the exact same values. It expires
-after five minutes, is consumed once, and is consumed by a mismatched attempt.
+with legacy `allow_launch` or `profile` fields. Authorization depends on the
+daemon's immutable [permission mode](/reference/cua-driver/permission-modes):
+
+- `standard` requests exact confirmation from the runtime's provider.
+- `bounded` requires the launch-approved manifest to list this PID/window;
+  the provider activates its persistent Stop indicator without a second prompt.
+- `unrestricted` attaches without a runtime approval after the trusted launcher
+  supplied `--dangerously-bypass-approvals`.
 
 The internal approval marker supplied by an MCP transport does not authorize
-this strategy.
+this strategy. Interactive standalone daemons use Cua's native confirmation
+card. Headless daemons without a confirmation surface fail closed in
+`standard`, and bounded attachment fails when its required persistent
+indicator cannot be shown.
+
+![Cua Driver confirmation card beside its persistent session indicator](/img/cua-driver-consent-ui.jpg)
+
+The native card is same-desktop, best-effort confirmation. It prevents
+tool-argument forgery and clearly presents the exact operation, but another
+process or remote-desktop controller that can automate the same desktop can
+activate it. It is not a secure-desktop or biometric boundary. Use a stronger
+host-provided collector when local hostile automation is in scope.
+
+The old `browser-approve` file artifact is disabled by default. A trusted
+launcher can temporarily enable it with
+`--allow-legacy-existing-profile-approval`. The artifact is same-user writable
+and is not protected human consent.
 
 ## Success result
 
 A successful call returns `action: "attached_existing_profile"` and an
 `attachment` object with:
 
-| Field | Value |
-| --- | --- |
-| `kind` | `existing_profile` |
-| `browser` | `chromium` |
-| `capabilities_invalidated` | `true` |
-| `next_action` | `get_browser_state` |
+| Field                      | Value               |
+| -------------------------- | ------------------- |
+| `kind`                     | `existing_profile`  |
+| `browser`                  | `chromium`          |
+| `capabilities_invalidated` | `true`              |
+| `next_action`              | `get_browser_state` |
 
 `side_effects` reports the bounded setup and consent effects:
 
-| Field | Meaning |
-| --- | --- |
-| `opened_setup_page` | A temporary tab was opened in the approved native window. |
-| `closed_setup_page` | That temporary setup tab was closed successfully. |
-| `focused_setup_address_field` | The temporary tab's address field received in-app focus for exact navigation. |
-| `enabled_remote_debugging` | The exact per-instance Chrome checkbox was toggled from off to on. |
-| `changed_preferences` | Mirrors `enabled_remote_debugging` for the generic prepare contract. |
-| `displayed_consent_prompt` | Chrome displayed its browser-owned connection-consent prompt. |
+| Field                         | Meaning                                                                                                                |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `opened_setup_page`           | A temporary tab was opened in the approved native window.                                                              |
+| `closed_setup_page`           | That temporary setup tab was closed successfully.                                                                      |
+| `focused_setup_address_field` | The temporary tab's address field received in-app focus for exact navigation.                                          |
+| `enabled_remote_debugging`    | The exact per-instance Chrome checkbox was toggled from off to on and the same control's resulting state was verified. |
+| `used_bounded_pixel_fallback` | macOS used its setup-page-only pixel route to read or change the checkbox after the web AX subtree was unavailable.    |
+| `foregrounded_window`         | Setup temporarily foregrounded the exact approved browser window for a bounded local action.                           |
+| `injected_global_input`       | Setup delivered global mouse or keyboard input only after revalidating the approved browser process and window.        |
+| `changed_preferences`         | Mirrors `enabled_remote_debugging` for the generic prepare contract.                                                   |
+| `displayed_consent_prompt`    | Chrome displayed its browser-owned connection-consent prompt.                                                          |
 
 All fields are `false` when the endpoint was already available. The driver does
 not return the profile identity, endpoint address, port, connection generation,
@@ -60,6 +81,25 @@ A refusal after setup begins may include `detail.setup_side_effects`. This uses
 the same setup fields and adds `restored_remote_debugging` when the driver had
 to reverse its own checkbox change. It never claims cleanup succeeded unless
 the exact checkbox returned to the off state.
+
+On macOS, Cua Driver prefers the checkbox's semantic AX action. Current Chrome
+versions can withhold the internal page's web AX subtree even while exposing
+the native address field and selected setup tab. The bounded fallback runs only
+in the temporary tab Cua Driver created and navigated, after the fixed internal
+URL is committed, the expected title is selected, and no omnibox edit is in
+progress. It requires one unique checkbox-shaped control in the setup-page
+region, revalidates the unchanged window, sends the click only to the approved
+browser PID, and verifies the visual state change. That bounded global-input
+route may briefly foreground the exact approved window and then restores the
+previous frontmost app; `foregrounded_window` and `injected_global_input` report
+what occurred. Unsupported appearance, scale, zoom, window-size, or
+browser-toolbar geometry—including layouts shifted by a bookmarks bar—is
+refused without a click. It is not available for ordinary web content.
+
+On refusal, `restored_remote_debugging: true` means the exact semantic checkbox,
+or the setup page's sole bounded pixel checkbox when web AX became unavailable,
+was proven off during cleanup. A false value means cleanup could not prove the
+state; callers must not infer that remote debugging is disabled.
 
 ## Grant lifetime
 
@@ -76,14 +116,15 @@ by the previous generation.
 
 ## Security properties
 
-| Property | Guarantee |
-| --- | --- |
-| Network exposure | The accepted DevTools endpoint must be loopback-only. |
-| Process binding | The endpoint, native window, and live process fingerprint must agree before every mutation. |
-| Driver authorization | Existing-profile setup needs a single-use interactive artifact; a model-supplied Boolean and ordinary MCP approval are insufficient. |
-| Capability scope | Targets, tabs, dialogs, frames, and refs are opaque, session-scoped, and invalidated after navigation or connection-generation changes. |
-| Profile handling | Cua Driver does not copy, edit, restart, or terminate the selected existing profile. |
-| Residual local risk | CDP itself is not authenticated. Another process running as the same OS user may connect to an exposed endpoint outside Cua Driver. |
+| Property             | Guarantee                                                                                                                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Network exposure     | The accepted DevTools endpoint must be loopback-only.                                                                                                                                                                                             |
+| Process binding      | The endpoint, native window, and live process fingerprint must agree before every mutation.                                                                                                                                                       |
+| Driver authorization | Standard and bounded setup need a request-bound confirmation provider; a model-supplied Boolean, ordinary MCP approval, TTY input, and files are insufficient. The built-in native card has `same_desktop_best_effort` assurance.                 |
+| Revocation           | A grant cannot become live until its provider activates persistent Stop UI. `cua-driver revoke` and session end provide additional deny-only paths.                                                                                               |
+| Capability scope     | Targets, tabs, dialogs, frames, and refs are opaque, session-scoped, and invalidated after navigation or connection-generation changes.                                                                                                           |
+| Profile handling     | Cua Driver does not copy, edit, restart, or terminate the selected existing profile.                                                                                                                                                              |
+| Residual local risk  | CDP itself is not authenticated. Another process running as the same OS user may connect to an exposed endpoint outside Cua Driver. Another automation runtime with control of the same desktop may also activate the built-in confirmation card. |
 
 An isolated profile is the recommended default. Existing-profile attachment is
 appropriate only when the task requires its authenticated state and the host is
@@ -92,16 +133,19 @@ for why Cua Driver uses CDP and which risks remain outside the driver.
 
 ## Refusals
 
-| Code | Meaning |
-| --- | --- |
-| `browser_consent_required` | No live exact approval exists, or it expired. |
-| `browser_consent_revoked` | The person dismissed or denied the browser prompt. |
-| `browser_requires_setup` | No unique approved browser endpoint is available. |
-| `browser_endpoint_owner_mismatch` | Endpoint ownership or identity changed. |
-| `browser_wrong_target_refused` | The native window, prompt, or browser target is not exact. |
-| `browser_binding_stale` | A connection generation changed; bind again. |
-| `browser_reconnect_exhausted` | The bounded reconnect policy could not establish a proven socket. |
-| `browser_input_incomplete` | Keystroke typing delivered only a reported prefix. |
+| Code                              | Meaning                                                                                                                                                                  |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `browser_consent_required`        | No live exact approval exists, or it expired.                                                                                                                            |
+| `browser_consent_revoked`         | The person dismissed or denied the browser prompt.                                                                                                                       |
+| `browser_requires_setup`          | No unique approved browser endpoint is available.                                                                                                                        |
+| `browser_endpoint_owner_mismatch` | Endpoint ownership or identity changed.                                                                                                                                  |
+| `browser_wrong_target_refused`    | The native window, prompt, or browser target is not exact.                                                                                                               |
+| `browser_binding_stale`           | A connection generation changed; bind again.                                                                                                                             |
+| `browser_reconnect_exhausted`     | The bounded reconnect policy could not establish a proven socket.                                                                                                        |
+| `browser_input_incomplete`        | Keystroke typing delivered only a reported prefix.                                                                                                                       |
+| `browser_route_unavailable`       | The classified engine or platform has no accepted typed route. For Firefox and Safari, bounded detail identifies the required protocol and current lifecycle limitation. |
+| `browser_input_trust_unavailable` | Trusted input cannot preserve background posture. Bounded detail identifies the explicit `dom_event` alternative when a synthetic ref-targeted action is acceptable.     |
+| `browser_origin_outside_scope`    | A bounded-mode tab left the manifest's allowed origin set; further mutation pauses.                                                                                      |
 
 ## Recording and telemetry
 
@@ -114,22 +158,27 @@ The content-free browser operation and refusal fields are documented in
 
 ## Platform scope
 
-The prompt-assisted route is available for Google Chrome and Microsoft Edge on
-macOS and Windows. Chrome has product-specific acceptance evidence on Linux
-X11 and on the validated native-Wayland Sway lane. Chromium and Edge use the
-same descriptor-backed Linux route, but still need product-specific acceptance
-evidence before they are listed as validated. Every route requires an
-exact approved PID and native window, one uniquely matched setup control, a
+The browser-setup route is implemented for Google Chrome and Microsoft Edge on
+macOS and Windows. Chrome and Edge have product-specific acceptance evidence
+on Linux X11. Chrome is also accepted on GNOME Wayland, and Chromium is
+accepted alongside Chrome and Edge on the validated native-Wayland Sway lane.
+The Chromium-family products use the same descriptor-backed Linux route, but
+still need product-specific acceptance evidence on each desktop before they
+are listed as validated. Every route
+requires an
+exact authorized PID and native window, one uniquely matched setup control, a
 loopback endpoint owned by that process, one exact browser-owned consent
 action, and a fresh native/CDP rebind.
 
 Linux additionally requires the browser's complete AT-SPI renderer tree. Start
 the Chromium-family process with `--force-renderer-accessibility`, or run a
-screen reader that enables full renderer accessibility. On Sway, Cua Driver
-briefly focuses the exact compositor-attested container for fixed internal-page
-navigation and restores the previous container before continuing. It refuses
-generic Wayland sessions that cannot prove exact process, window, and geometry
-identity.
+screen reader that enables full renderer accessibility. On Sway and validated
+GNOME Shell sessions, Cua Driver briefly focuses the exact
+compositor-attested window for fixed internal-page navigation and restores the
+previous window before continuing. GNOME requires the maintained WinRects
+helper API v4 and an immutable D-Bus owner that resolves to the current user's
+system-installed GNOME Shell process. Cua Driver refuses generic Wayland
+sessions that cannot prove exact process, window, and geometry identity.
 
 The setup adapters currently recognize the products' English accessibility
 labels. Other UI locales fail closed without toggling an unrecognized control.

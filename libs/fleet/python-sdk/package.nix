@@ -45,7 +45,7 @@ let
 in
 pp.buildPythonPackage {
   pname = "cua-train";
-  version = "0.1.0";
+  version = "0.1.1";
   pyproject = true;
 
   src = builtins.path {
@@ -124,6 +124,12 @@ pp.buildPythonPackage {
     pytestCheckHook
     pytest-httpx
   ];
+
+  # test_wheel_build stages the wheel from the repo-absolute path
+  # /cyclops-cs/python-sdk (valid in the cyclops-cs repo CI container, absent in
+  # the Nix sandbox) -> FileNotFoundError, which failed every worker image
+  # build on main. Environment-dependent, not a property of the package: skip.
+  disabledTestPaths = [ "tests/test_wheel_build.py" ];
 
   pythonImportsCheck = [ "cua_train" ];
 
